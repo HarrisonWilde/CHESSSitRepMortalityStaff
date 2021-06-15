@@ -1,0 +1,3163 @@
+---
+title: "CHESS Linkage for both cohorts (ICU and HDU)"
+output: 
+   html_document:
+     self_contained: false
+---
+
+
+```{r, eval=FALSE}
+
+cd ~/CHESSSitRepMortalityStaff/
+module load R
+module load gnu7
+# The following line SCHEDULES an interactive job with 4 cores and 4000mb of RAM per core to run on the CLUSTER resources for 5 days, if you are not using it, ensure to EXIT the job (by typing exit at the top level) so as not to overload the cluster, check that the number of cores matches the number of threads you use in stan models for optimal efficiency
+srun --nodes=1 --tasks-per-node=4 --mem-per-cpu=4000 --time=120:00:00 --pty bash
+R
+
+```
+
+# Loading Packages
+
+```{r setup}
+
+library(egg)
+library(tidyverse)
+library(rio)
+library(lubridate)
+library(maptools)
+library(ggpubr)
+library(zoo)
+library(fuzzyjoin)
+library(scales)
+library(rms)
+library(broom)
+library(survival)
+library(readxl)
+library(dplyr)
+library(knitr)
+library(finalfit)
+library(coxme)
+library(janitor)
+library(cobalt)
+library(kableExtra)
+library(forecast)
+library(RColorBrewer)
+library(splines)
+library(bayesplot)
+library(loo)
+library(tidybayes)
+library(brms)
+library(cmdstanr)
+library(ggridges)
+library(bayestestR)
+library(pracma)
+library(tableone)
+
+plot_dir <- "plots/"
+data_dir <- "data/"
+chess_path <- paste0(data_dir, "SARI COVID19 CaseReport 20210305.xlsx")
+
+```
+
+First we run the code based on preparechess_July.R
+
+```{r chessimport}
+chess <- suppressWarnings(tibble(read_excel(chess_path)))
+
+chess$dateadmittedicu <- as.character(chess$dateadmittedicu)
+chess$finaloutcomedate <- as.character(chess$finaloutcomedate)
+chess$hospitaladmissiondate <- as.character(chess$hospitaladmissiondate)
+chess$dateleavingicu <- as.character(chess$dateleavingicu)
+chess$dateupdated <- as.character(chess$dateupdated)
+
+chess_raw <- chess
+
+lsoa_to_postcode <- import("lsoa_to_district.csv", setclass="tibble") %>% select(-4)
+names(lsoa_to_postcode) <- c("District", "Proportion_in_LSOA", "LSOA_Code")
+lsoa_to_imd <- read_excel("lsoa_to_imd.xlsx", sheet="IMD 2015")
+names(lsoa_to_imd) <- c("LSOA_Code", "LSOA_Name", "LAD_Code", "LAD_Name", "IMD_Rank", "IMD_Decile")
+
+df <- inner_join(lsoa_to_imd, lsoa_to_postcode) %>% group_by(District) %>% summarise(Weighted_IMD = weighted.mean(IMD_Decile, Proportion_in_LSOA))
+
+chess_imd <- inner_join(chess_raw, df, by = c("postcode" = "District"))
+
+chess <- chess_imd
+
+###################################
+#Exploratory analysis data prep
+###################################
+
+#Define function to clean missing data
+empty_as_missing <- function(x){
+    if("factor" %in% class(x)) x <- as.character(x) # since ifelse wont work with factors
+    ifelse(is.na(as.character(x)), "Missing",x)
+}
+
+## set all missing ("") to Missing for all columns
+chess <- chess %>% mutate_each(funs(empty_as_missing))
+  
+#define age categories
+chess$ageyear <- as.numeric(chess$ageyear)
+
+chess$agecat=cut(chess$ageyear,c(0,18,25,35,45,55,65,75,85,100),include.lowest = TRUE,right=FALSE)
+
+chess$agecat2 <- fct_collapse(chess$agecat,
+  "18-45"=c("[18,25)","[25,35)","[35,45)"),
+  "45-64"=c("[45,55)","[55,65)"),
+  "65+"=c("[65,75)","[75,85)","[85,100]")
+)
+
+#define ethnicity groups, from "Harmonised Concepts and Questins for Social Data Sources - Primary Standards: Ethnic Group" (PDF). Office for National Statistics. Archived (PDF)
+chess <- chess %>% mutate(
+  ethnicity5 = ifelse(
+    ethnicity=="Chinese"|ethnicity=="Bangladeshi"|ethnicity=="Indian"|ethnicity=="Pakistani"|ethnicity=="Other Asian",
+    "Asian",
+    ifelse(
+      ethnicity=="Black Caribbean"|ethnicity=="Black African"|ethnicity=="Other Black",
+      "Black",
+      ifelse(
+        ethnicity=="other",
+        "Other", 
+        ifelse(
+          ethnicity=="White British"|ethnicity=="White Irish"|ethnicity=="British"|ethnicity=="Irish"|ethnicity=="Other White",
+          "White",
+          ifelse(
+            ethnicity=="White and Black African"|ethnicity=="White and Black Caribbean"|ethnicity=="White and Asian"|ethnicity=="Other mixed",
+            "Mixed",
+            ifelse(
+              ethnicity=="Unknown",
+              "Missing",
+              ethnicity
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+chess <- chess %>% mutate(
+  ethnicity6 = ifelse(
+    ethnicity=="Chinese"|ethnicity=="Other Asian",
+    "Asian (Other)",
+    ifelse(
+      ethnicity=="Bangladeshi"|ethnicity=="Indian"|ethnicity=="Pakistani",
+      "Asian Subcontinent",
+      ifelse(
+          ethnicity=="Black Caribbean"|ethnicity=="Black African"|ethnicity=="Other Black",
+          "Black",
+          ifelse(
+            ethnicity=="other",
+            "Other", 
+            ifelse(
+              ethnicity=="White British"|ethnicity=="White Irish"|ethnicity=="British"|ethnicity=="Irish"|ethnicity=="Other White",
+              "White",
+              ifelse(
+                ethnicity=="White and Black African"|ethnicity=="White and Black Caribbean"|ethnicity=="White and Asian"|ethnicity=="Other mixed",
+                "Mixed",
+                ifelse(
+                  ethnicity=="Unknown",
+                  "Missing",
+                  ethnicity
+                )
+              )
+            )
+          )
+      )
+    )
+  )
+)
+
+#BMI - define obese patients by either recorded obesity category or clinical obesity
+chess <- chess %>% mutate(
+  obese = ifelse(
+    obesitybmi=="25-29.9"|obesitybmi=="30-39.9"|obesitybmi==">39.9",
+    "Obese",
+    ifelse(
+      obesitybmi=="<18.5"|obesitybmi=="18.5-24.9"|obesitybmi=="No",
+      "Non-Obese",
+      "Missing"
+    )
+  )
+)
+
+chess <- chess %>% mutate(
+  obese=factor(
+      ifelse(
+      (obesitybmi=="Missing"|obesitybmi=="Unknown") & obesityclinical=="Yes",
+      "Obese",
+      ifelse(
+        (obesitybmi=="Missing"|obesitybmi=="Unknown"|obesitybmi=="No") & (obesityclinical=="Borderline"|obesityclinical=="No"),
+        "Non-Obese",
+        obese
+      )
+    )
+  )
+)  
+
+#Pregnancy
+chess <- chess %>% mutate(pregnant=ifelse(pregnancy=="Yes","Yes","No"))
+
+#Encode dates
+chess$dateadmittedicu <- as.Date(chess$dateadmittedicu, "%Y-%m-%d")
+
+chess$finaloutcomedate <- as.Date(chess$finaloutcomedate, "%Y-%m-%d")
+
+chess$hospitaladmissiondate <- as.Date(chess$hospitaladmissiondate, "%Y-%m-%d")
+
+chess$dateleavingicu <- as.Date(chess$dateleavingicu, "%Y-%m-%d")
+
+chess$dateupdated <- as.Date(chess$dateupdated, "%Y-%m-%d")
+
+
+chess <- chess %>% mutate(dateleavingicu=ifelse(dateleavingicu<=as.Date("2020-01-01"),NA,dateleavingicu))
+
+chess <- chess %>% mutate(dateadmittedicu=ifelse(chess$dateadmittedicu<=as.Date("2020-01-01"),NA,chess$dateadmittedicu))
+
+chess <- chess %>% mutate(finaloutcomedate=ifelse(chess$finaloutcomedate<=as.Date("2020-01-01"),NA,chess$finaloutcomedate))
+
+chess <- chess %>% mutate(hospitaladmissiondate=ifelse(chess$hospitaladmissiondate<=as.Date("2020-01-01"),NA,chess$hospitaladmissiondate))
+
+chess <- chess %>% mutate(dateupdated=ifelse(chess$dateupdated<=as.Date("2020-01-01"),NA,chess$dateupdated))
+
+class(chess$dateleavingicu) <- "Date"
+
+class(chess$dateadmittedicu) <- "Date"
+
+class(chess$finaloutcomedate) <- "Date"
+
+class(chess$hospitaladmissiondate) <- "Date"
+
+class(chess$dateupdated) <- "Date"
+
+
+#define time from admitted to hospital / ICU to time to finaloutcomedate
+chess$timetooutcome_hosp <- as.numeric(difftime(chess$finaloutcomedate,chess$hospitaladmissiondate, units = c("days")))
+
+chess$timetooutcome_icu <- as.numeric(difftime(chess$finaloutcomedate,chess$dateadmittedicu, units = c("days")))
+
+#define time from admitted to hospital to when admitted to ICU
+chess$timetoicu <- as.numeric(difftime(chess$dateadmittedicu,chess$hospitaladmissiondate, units = c("days")))
+
+##Define new comorbidity vars with Missing/Unknown recoded to No
+chess <- chess %>% mutate(isdiabetes_clean=factor(ifelse(isdiabetes=="Missing"|isdiabetes=="Unknown","No",isdiabetes)))
+
+chess <- chess %>% mutate(chronicrespiratory_clean=factor(ifelse(chronicrespiratory=="Missing"|chronicrespiratory=="Unknown","No",chronicrespiratory)))
+
+chess <- chess %>% mutate(asthmarequiring_clean=factor(ifelse(asthmarequiring=="Missing"|asthmarequiring=="Unknown","No",asthmarequiring)))
+
+chess <- chess %>% mutate(chronicheart_clean=factor(ifelse(chronicheart=="Missing"|chronicheart=="Unknown","No",chronicheart)))
+
+chess <- chess %>% mutate(chronicrenal_clean =factor(ifelse(chronicrenal=="Missing"|chronicrenal=="Unknown","No",chronicrenal)))
+
+chess <- chess %>% mutate(chronicliver_clean=factor(ifelse(chronicliver=="Missing"|chronicliver=="Unknown","No",chronicliver)))
+
+chess <- chess %>% mutate(chronicneurological_clean=factor(ifelse(chronicneurological=="Missing"|chronicneurological=="Unknown","No",chronicneurological)))
+
+chess <- chess %>% mutate(immunosuppressiondisease_clean=factor(ifelse(immunosuppressiondisease=="Missing"|immunosuppressiondisease=="Unknown","No",immunosuppressiondisease)))
+
+chess <- chess %>% mutate(pregnancy_clean =factor(ifelse(pregnancy=="Missing"|pregnancy=="Unknown","No",pregnancy)))
+
+chess <- chess %>% mutate(hypertension_clean =factor(ifelse(hypertension=="Missing"|hypertension=="Unknown","No",hypertension)))
+
+chess <- chess %>% mutate(respiratory_and_asthma_clean =factor(ifelse(asthmarequiring=="Yes"|chronicrespiratory=="Yes","Yes","No")))
+
+chess$respiratory_and_asthma_clean <- relevel(chess$respiratory_and_asthma_clean, ref="No")
+
+
+## Relevel factors for modelling
+chess$isdiabetes <- relevel(as.factor(chess$isdiabetes), ref = "No")
+
+chess <- chess %>% mutate(agecat=factor(agecat))
+
+chess$agecat <- relevel(chess$agecat, ref = "[55,65)")
+
+chess$agecat2 <- relevel(chess$agecat2,ref="18-45")
+
+chess$ethnicity5 <- relevel(factor(chess$ethnicity5), ref = "White")
+chess$ethnicity6 <- relevel(factor(chess$ethnicity6), ref = "White")
+
+chess$chronicrespiratory <- relevel(factor(chess$chronicrespiratory), ref = "No")
+
+chess$asthmarequiring<- relevel(factor(chess$asthmarequiring), ref = "No")
+
+chess$chronicheart <- relevel(factor(chess$chronicheart), ref = "No")
+
+chess$chronicrenal <- relevel(factor(chess$chronicrenal), ref = "No")
+
+chess$chronicliver <- relevel(factor(chess$chronicliver), ref = "No")
+
+chess$immunosuppressiondisease <- relevel(factor(chess$immunosuppressiondisease), ref = "No")
+
+chess$hypertension <- relevel(factor(chess$hypertension), ref = "No")
+
+chess$chronicneurological <- relevel(factor(chess$chronicneurological), ref = "No")
+
+chess$obese <- relevel(factor(chess$obese), ref = "Non-Obese")
+
+chess_prepared <- chess
+```
+
+# Defining Survival Analysis Variables
+
+```{r survivalanalysis}
+chess <- chess_prepared
+
+#Define Failure as death, others as censoring events
+chess <- chess %>% mutate(outcome=ifelse(finaloutcome=="Death",1,0))
+
+#survival time
+#define a last study date
+chess$lastdate <- max(chess$finaloutcomedate,na.rm=TRUE)
+
+#Define date of last follow-up as finaloutcomedate if recorded, if not the dateupdated, if not the lastdate
+chess <- chess %>% mutate(lfudate=as.character(finaloutcomedate))
+
+chess <- chess %>% mutate(lfudate=ifelse(is.na(lfudate),as.character(dateupdated),lfudate))
+
+chess <- chess %>% mutate(lfudate=ifelse(is.na(lfudate),as.character(lastdate),lfudate))
+
+chess$lfudate <- as.Date(chess$lfudate)
+
+#ICU cohort: Define stime as lfudate - date admitted ICU 
+chess <- chess %>% mutate(stime_icu=as.numeric(difftime(chess$lfudate,chess$dateadmittedicu, units = c("days"))+0.5))
+
+#HDU cohort: Define follow up time variable as date of last follow up - 
+#Define stime as lfudate - date admitted hospital
+chess <- chess %>% mutate(stime_hdu=as.numeric(difftime(chess$lfudate,chess$hospitaladmissiondate, units = c("days"))+0.5))
+
+chess <- chess %>% mutate(
+  week_icu = as.numeric(strftime(dateadmittedicu, format = "%V")), 
+  week_hosp = as.numeric(strftime(hospitaladmissiondate, format = "%V"))
+)
+
+chess <- chess %>% mutate(
+  #outcome = factor(outcome),
+  trustcode = factor(trustcode),
+  ageclass = cut(ageyear,c(0,6,14,24,44,54,64,74,84,150))
+)
+
+chess <- chess %>% mutate(dex = factor(ifelse(dateadmittedicu > "2020-06-15", 1, 0)))
+
+chess_with_survival_analysis <- chess
+```
+
+
+# Filtering Cohorts (Overall)
+
+
+```{r describedata}
+
+# Carefully set this
+start_date <- date("2020-04-01")
+end_date <- date("2021-03-02")
+outcome_cutoff <- date("2021-03-05")
+
+chess <- chess_with_survival_analysis
+
+#Starting n
+print("Full CHESS")
+nrow(chess)
+nrow(data.frame(unique(chess$trustname)))
+
+# Define the cohort of ICU admitted patients
+## Require: valid ICU admission date for time to event
+chess <- chess %>% mutate(icudatevalid=ifelse(!is.na(dateadmittedicu),1,0))
+
+icu <- chess %>% filter(icudatevalid == 1) %>% mutate(admissiondate = dateadmittedicu)
+hdu <- chess %>% filter(icudatevalid == 0) %>% mutate(admissiondate = hospitaladmissiondate)
+
+print(table(chess$icudatevalid))
+print(length(unique(icu$trustname)))
+print(length(unique(hdu$trustname)))
+
+filter_dates <- function(df, label="All CHESS") {
+  #Filter based on cohort date
+  df <- df %>% mutate(include = ifelse(admissiondate > start_date & admissiondate < end_date, 1, 0))
+  print(label)
+  print(table(df$include))
+  print(table(df %>% group_by(trustname) %>% summarise(maxi = max(c(include, 0), na.rm=T)) %>% pull(maxi)))
+  return(df %>% filter(include == 1))
+}
+
+icu <- filter_dates(icu, "ICU")
+hdu <- filter_dates(hdu, "HDU")
+
+
+filter_demographics <- function(df, label="All CHESS") {
+  #remove anyone with missing age from the cohort
+  df <- df %>% mutate(naage = ifelse(is.na(ageyear), 1, 0))
+
+  #remove anyone >99 from the cohort
+  df <- df %>% mutate(over99 = ifelse(ageyear > 99, 1, 0))
+
+  #remove anyone < 18 from the cohort
+  df <- df %>% mutate(under18 = ifelse(ageyear < 18, 1, 0))
+
+  #remove anyone with unknown sex from the cohort
+  df <- df %>% mutate(unknownsex = ifelse(sex == "Unknown", 1, 0))
+
+  #Exclude pregnant
+  df <- df %>% mutate(preg = ifelse(pregnant == "Yes", 1, 0))
+
+  df <- df %>% mutate(include = 1 - pmax(naage, over99, under18, unknownsex, preg, na.rm=T))
+
+  print(df %>% select(naage, over99, under18, unknownsex, preg) %>% colSums(na.rm=T))
+
+  print(label)
+  print(table(df$include))
+  print(table(df %>% group_by(trustname) %>% summarise(maxi = max(c(include, 0), na.rm=T)) %>% pull(maxi)))
+  return(df %>% filter(include == 1))
+}
+
+icu <- filter_demographics(icu, "ICU")
+hdu <- filter_demographics(hdu, "HDU")
+
+filter_outcomes <- function(df, label="All CHESS") {
+
+  # No known outcome
+  df <- df %>% mutate(nooutcome=ifelse(finaloutcome=="Missing",1,0))
+  df <- df %>% mutate(icubeforehosp=ifelse(icudatevalid == 1 & dateadmittedicu < hospitaladmissiondate - days(1), 1, 0))
+  df <- df %>% mutate(finalbeforeicu=ifelse(icudatevalid == 1 & finaloutcomedate < dateadmittedicu - days(1), 1, 0))
+  df <- df %>% mutate(finalbeforehosp=ifelse(finaloutcomedate < hospitaladmissiondate - days(1), 1, 0))
+  df <- df %>% mutate(nahosp=ifelse(is.na(hospitaladmissiondate), 1, 0))
+  
+  df <- df %>% mutate(include = 1 - pmax(nooutcome, icubeforehosp, finalbeforeicu, finalbeforehosp, nahosp, na.rm=T))
+
+  print(df %>% select(nooutcome, icubeforehosp, finalbeforeicu, finalbeforehosp, nahosp) %>% colSums(na.rm=T))
+
+  print(label)
+  print(table(df$include))
+  print(table(df %>% group_by(trustname) %>% summarise(maxi = max(c(include, 0), na.rm=T)) %>% pull(maxi)))
+  return(df %>% filter(include == 1))
+
+}
+
+icu <- filter_outcomes(icu, "ICU")
+hdu <- filter_outcomes(hdu, "HDU")
+
+```
+
+# ICU Specific
+
+```{r}
+
+# Date stuff
+icu_dated <- icu
+
+for (i in 1:nrow(icu_dated)) {
+  row = icu_dated[i,]
+  if (!is.na(row[["finaloutcomedate"]]) & row[["finaloutcomedate"]] > outcome_cutoff) {
+    row[["finaloutcomedate"]] = outcome_cutoff
+    row[["finaloutcome"]] = "N/A - still on unit"
+    row[["outcome"]] = 0
+  }
+  icu_dated[i,] = row
+}
+
+primary_icu <- icu_dated %>% filter(finaloutcome != "N/A - still on unit") %>% filter(!is.na(finaloutcomedate))
+sens1_icu <- icu_dated %>% filter(!is.na(finaloutcomedate) | finaloutcome == "N/A - still on unit") %>% mutate(finaloutcomedate = as.Date(ifelse(is.na(finaloutcomedate), outcome_cutoff, finaloutcomedate)))
+sens2_icu <- icu_dated %>% filter(finaloutcome != "N/A - still on unit") %>% mutate(finaloutcomedate = as.Date(ifelse(is.na(finaloutcomedate), outcome_cutoff, finaloutcomedate)))
+
+print("Primary")
+nrow(primary_icu)
+length(unique(primary_icu$trustcode))
+print("Sensitivity including patients still on unit")
+nrow(sens1_icu)
+length(unique(sens1_icu$trustcode))
+print("Sensitivity includes patients with no final outcomedate but a finaloutcome")
+nrow(sens2_icu)
+length(unique(sens2_icu$trustcode))
+
+```
+
+# HDU Specific
+
+```{r}
+
+# Date stuff
+hdu_dated <- hdu
+
+for (i in 1:nrow(hdu_dated)) {
+  row = hdu_dated[i,]
+  if (!is.na(row[["finaloutcomedate"]]) & row[["finaloutcomedate"]] > outcome_cutoff) {
+    row[["finaloutcomedate"]] = outcome_cutoff
+    row[["finaloutcome"]] = "N/A - still on unit"
+    row[["outcome"]] = 0
+  }
+  hdu_dated[i,] = row
+}
+
+primary_hdu <- hdu_dated %>% filter(finaloutcome != "N/A - still on unit") %>% filter(!is.na(finaloutcomedate))
+sens1_hdu <- hdu_dated %>% filter(!is.na(finaloutcomedate) | finaloutcome == "N/A - still on unit") %>% mutate(finaloutcomedate = as.Date(ifelse(is.na(finaloutcomedate), outcome_cutoff, finaloutcomedate)))
+sens2_hdu <- hdu_dated %>% filter(finaloutcome != "N/A - still on unit") %>% mutate(finaloutcomedate = as.Date(ifelse(is.na(finaloutcomedate), outcome_cutoff, finaloutcomedate)))
+
+print("Primary")
+nrow(primary_hdu)
+length(unique(primary_hdu$trustcode))
+print("Sensitivity including patients still on unit")
+nrow(sens1_hdu)
+length(unique(sens1_hdu$trustcode))
+print("Sensitivity includes patients with no final outcomedate but a finaloutcome")
+nrow(sens2_hdu)
+length(unique(sens2_hdu$trustcode))
+
+```
+
+
+# Modelling
+
+Below is code for a simple mortality cox and logistic regression classification model
+
+**Population**: People in CHESS admitted to ICU before the calendar date of CHESS dataset last follow-up date - 30 days. This means everyone has at least 30 days follow-up and we are not censoring anyone, so we can use a binary outcome model (died/not died). NB some patients have no dateupdated (28%) OR finaloutcomedate (15.5%) - I have assumed these patients survive in the main analysis, in a sensitivity analysis we should exclude these people (need to know how have neither - the variable is chess$deathstatusnotconfirmed)
+
+**Outcome**: 30 day in-hospital mortality from date of ICU / HDU admission
+If someone is discharged assume they have survived to 30 days (they have not died in hospital)
+
+Final cleaning and recording of factors as integers
+
+# Beds Data Incorporation
+
+Load the beds data exported from eda.rmd
+
+```{r}
+# load(paste0(data_dir, "beds.RData"))
+load(paste0(data_dir, "beds_full.RData"))
+
+nrow(trust_df_beds)
+length(unique(trust_df_beds$OrgCode))
+
+
+# ADDITIONAL CLEANING OF CRITICALCAREBEDSAVAILABLE TO FILL IN 0s WITH PREVIOUS NON-ZERO DAY
+trust_df_beds_filled <- trust_df_beds %>% 
+  mutate(BedsCriticalCareAvailable = ifelse(BedsCriticalCareAvailable == 0, NA, BedsCriticalCareAvailable)) %>% 
+  arrange(Date) %>% 
+  group_by(OrgCode) %>% 
+  fill(BedsCriticalCareAvailable, .direction = "down")
+
+
+#Filter based on cohort date
+trust_df_beds_dated <- trust_df_beds_filled %>% filter(Date > start_date & Date < end_date)
+nrow(trust_df_beds_dated)
+length(unique(trust_df_beds_dated$OrgCode))
+
+
+df_sitrep <- trust_df_beds_dated %>%
+  group_by(OrgCode) %>%
+  mutate(
+    max_BedsVentAvailable = max(BedsVentAvailable, na.rm=T),
+    min_BedsVentAvailable = min(BedsVentAvailable, na.rm=T),
+    baseline_BedsVentAvailable = max(BedsVentAvailableBaseline, na.rm=T),
+    max_BedsCriticalCareAvailable = max(BedsCriticalCareAvailable, na.rm=T),
+    min_BedsCriticalCareAvailable = min(BedsCriticalCareAvailable, na.rm=T),
+    baseline_BedsCriticalCareAvailable = max(BedsCriticalCareAvailableBaseline, na.rm=T)
+  ) %>% 
+  ungroup() %>%
+  mutate(
+    CriticalCareMobiFac = max_BedsCriticalCareAvailable / min_BedsCriticalCareAvailable,
+    CriticalCareMobiFacBaseline = max_BedsCriticalCareAvailable / baseline_BedsCriticalCareAvailable,
+    VentDeltaOcc = (BedsVentOccupied - min_BedsVentAvailable) / (max_BedsVentAvailable - min_BedsVentAvailable),
+    VentDeltaOccBaseline = (BedsVentOccupied - baseline_BedsVentAvailable) / (max_BedsVentAvailable - baseline_BedsVentAvailable),
+    CriticalCareDeltaOcc = (BedsCriticalCareOccupied - min_BedsCriticalCareAvailable) / (max_BedsCriticalCareAvailable - min_BedsCriticalCareAvailable),
+    CriticalCareDeltaOccBaseline = (BedsCriticalCareOccupied - baseline_BedsCriticalCareAvailable) / (max_BedsCriticalCareAvailable - baseline_BedsCriticalCareAvailable),
+    VentMinOcc = (BedsVentOccupied - min_BedsVentAvailable) / (min_BedsVentAvailable),
+    VentBaselineOcc = (BedsVentOccupied - baseline_BedsVentAvailable) / (baseline_BedsVentAvailable),
+    CriticalCareMinOcc = (BedsCriticalCareOccupied - min_BedsCriticalCareAvailable) / (min_BedsCriticalCareAvailable),
+    CriticalCareBaselineOcc = (BedsCriticalCareOccupied - baseline_BedsCriticalCareAvailable) / (baseline_BedsCriticalCareAvailable),
+  ) %>%
+  mutate(
+    VentDeltaOcc = ifelse(is.infinite(VentDeltaOcc), 0, VentDeltaOcc),
+    VentDeltaOccBaseline = ifelse(is.infinite(VentDeltaOccBaseline), 0, VentDeltaOccBaseline),
+    CriticalCareDeltaOcc = ifelse(is.infinite(CriticalCareDeltaOcc), 0, CriticalCareDeltaOcc),
+    CriticalCareDeltaOccBaseline = ifelse(is.infinite(CriticalCareDeltaOccBaseline), 0, CriticalCareDeltaOccBaseline),
+    TrimmedVentDeltaOcc = ifelse(is.infinite(VentDeltaOcc), 0, ifelse(VentDeltaOcc < 0, 0, VentDeltaOcc)),
+    TrimmedVentDeltaOccBaseline = ifelse(is.infinite(VentDeltaOccBaseline), 0, ifelse(VentDeltaOccBaseline < 0, 0, VentDeltaOccBaseline)),
+    TrimmedCriticalCareDeltaOcc = ifelse(is.infinite(CriticalCareDeltaOcc), 0, ifelse(CriticalCareDeltaOcc < 0, 0, CriticalCareDeltaOcc)),
+    TrimmedCriticalCareDeltaOccBaseline = ifelse(is.infinite(CriticalCareDeltaOccBaseline), 0, ifelse(CriticalCareDeltaOccBaseline < 0, 0, CriticalCareDeltaOccBaseline)),
+    VentMinOcc = ifelse(is.infinite(VentMinOcc), 0, ifelse(VentMinOcc < 0, 0, VentMinOcc)),
+    VentBaselineOcc = ifelse(is.infinite(VentBaselineOcc), 0, ifelse(VentBaselineOcc < 0, 0, VentBaselineOcc)),
+    CriticalCareMinOcc = ifelse(is.infinite(CriticalCareMinOcc), 0, ifelse(CriticalCareMinOcc < 0, 0, CriticalCareMinOcc)),
+    CriticalCareBaselineOcc = ifelse(is.infinite(CriticalCareBaselineOcc), 0, ifelse(CriticalCareBaselineOcc < 0, 0, CriticalCareBaselineOcc))
+  ) %>%
+  mutate(
+    VentDeltaOccUsing = factor(ifelse(VentDeltaOcc > 0, "Yes", "No")),
+    VentDeltaOccBaselineUsing = factor(ifelse(VentDeltaOccBaseline > 0, "Yes", "No")),
+    CriticalCareDeltaOccUsing = factor(ifelse(CriticalCareDeltaOcc > 0, "Yes", "No")),
+    CriticalCareDeltaOccBaselineUsing = factor(ifelse(CriticalCareDeltaOccBaseline > 0, "Yes", "No"))
+  )
+
+
+df_primary_icu_linked <- primary_icu %>% inner_join(df_sitrep, by = c("trustcode" = "OrgCode", "admissiondate" = "Date")) %>% rename(entry_date = admissiondate)
+df_sens_with_still_on_unit_icu_linked <- sens1_icu %>% inner_join(df_sitrep, by = c("trustcode" = "OrgCode", "admissiondate" = "Date")) %>% rename(entry_date = admissiondate)
+df_sens_with_missing_fod_icu_linked <- sens2_icu %>% inner_join(df_sitrep, by = c("trustcode" = "OrgCode", "admissiondate" = "Date")) %>% rename(entry_date = admissiondate)
+
+print("Primary")
+nrow(df_primary_icu_linked)
+length(unique(df_primary_icu_linked$trustcode))
+print("Sensitivity including patients still on unit")
+nrow(df_sens_with_still_on_unit_icu_linked)
+length(unique(df_sens_with_still_on_unit_icu_linked$trustcode))
+print("Sensitivity includes patients with no final outcomedate but a finaloutcome")
+nrow(df_sens_with_missing_fod_icu_linked)
+length(unique(df_sens_with_missing_fod_icu_linked$trustcode))
+
+df_primary_hdu_linked <- primary_hdu %>% inner_join(df_sitrep, by = c("trustcode" = "OrgCode", "admissiondate" = "Date")) %>% rename(entry_date = admissiondate)
+df_sens_with_still_on_unit_hdu_linked <- sens1_hdu %>% inner_join(df_sitrep, by = c("trustcode" = "OrgCode", "admissiondate" = "Date")) %>% rename(entry_date = admissiondate)
+df_sens_with_missing_fod_hdu_linked <- sens2_hdu %>% inner_join(df_sitrep, by = c("trustcode" = "OrgCode", "admissiondate" = "Date")) %>% rename(entry_date = admissiondate)
+
+print("Primary")
+nrow(df_primary_hdu_linked)
+length(unique(df_primary_hdu_linked$trustcode))
+print("Sensitivity including patients still on unit")
+nrow(df_sens_with_still_on_unit_hdu_linked)
+length(unique(df_sens_with_still_on_unit_hdu_linked$trustcode))
+print("Sensitivity includes patients with no final outcomedate but a finaloutcome")
+nrow(df_sens_with_missing_fod_hdu_linked)
+length(unique(df_sens_with_missing_fod_hdu_linked$trustcode))
+
+```
+
+
+# HDU Only Modelling
+
+```{r setupforbettermodelling}
+
+ccdeltaoccusing_key <- df_sitrep %>% select(Date, trustcode = OrgCode, CriticalCareDeltaOccUsing) %>% spread(trustcode, CriticalCareDeltaOccUsing)
+ccdeltaoccbaselineusing_key <- df_sitrep %>% select(Date, trustcode = OrgCode, CriticalCareDeltaOccBaselineUsing) %>% spread(trustcode, CriticalCareDeltaOccBaselineUsing)
+
+proportion_ccdeltaocc <- function(start_date, end_date, trust) {
+  thing <- ccdeltaoccusing_key %>% filter(Date >= start_date & Date <= end_date + 1) %>% pull(trust)
+  return(sum(thing == "Yes", na.rm=T) / length(thing))
+}
+
+proportion_ccdeltaoccbaseline <- function(start_date, end_date, trust) {
+  thing <- ccdeltaoccbaselineusing_key %>% filter(Date >= start_date & Date <= end_date + 1) %>% pull(trust)
+  return(sum(thing == "Yes", na.rm=T) / length(thing))
+}
+
+setup_modelling_df <- function(df) {
+  
+  df <- df %>% filter(!is.na(CriticalCareRatio)) %>% filter(CriticalCareRatio != 0)
+
+  df <- df %>% rowwise() %>% mutate(CriticalCareDeltaOccUsingProportion = proportion_ccdeltaocc(entry_date, finaloutcomedate, trustcode)) %>% ungroup()
+  df <- df %>% rowwise() %>% mutate(CriticalCareDeltaOccBaselineUsingProportion = proportion_ccdeltaoccbaseline(entry_date, finaloutcomedate, trustcode)) %>% ungroup()
+
+  ratios <- c(
+    "CriticalCareRatio",
+    "VentRatio",
+    "GARatio",
+    "VentRatioC",
+    "GARatioC",
+    "VentRatioNC",
+    "GARatioNC",
+    "CriticalCareRatioU",
+    "VentRatioU",
+    "GARatioU"
+  )
+
+  baseline_ratios <- c(
+    "CriticalCareRatioBaseline",
+    "VentRatioBaseline",
+    "GARatioBaseline",
+    "VentRatioCBaseline",
+    "GARatioCBaseline",
+    "VentRatioNCBaseline",
+    "GARatioNCBaseline",
+    "CriticalCareRatioUBaseline",
+    "VentRatioUBaseline",
+    "GARatioUBaseline"
+  )
+
+  for (ratio in ratios) {
+    var_name <- paste0(ratio, "BinnedOld")
+    df[[var_name]] = cut(df[[ratio]], breaks=c(0., 0.85, 0.92, 2.), right=FALSE, labels=c("0-85%", "85-92%", "92-100%"))
+    var_name <- paste0(ratio, "Binned40")
+    df[[var_name]] = cut(df[[ratio]], breaks=c(0., 0.4, 0.85, 2.), right=FALSE, labels=c("0-40%", "40-85%", "85-100%"))
+    var_name <- paste0(ratio, "Binned50")
+    df[[var_name]] = cut(df[[ratio]], breaks=c(0., 0.5, 0.85, 2.), right=FALSE, labels=c("0-50%", "50-85%", "85-100%"))
+    var_name <- paste0(ratio, "BinnedFinal")
+    df[[var_name]] = cut(df[[ratio]], breaks=c(0., 0.45, 0.85, 2.), right=FALSE, labels=c("0-45%", "45-85%", "85-100%"))
+    var_name <- paste0(ratio, "BinnedTwo")
+    df[[var_name]] = cut(df[[ratio]], breaks=c(0., 0.85, 2.), right=FALSE, labels=c("0-85%", "85-100%"))
+    var_name <- paste0(ratio, "Binned425")
+    df[[var_name]] = cut(df[[ratio]], breaks=c(0., 0.425, 0.85, 2.), right=FALSE, labels=c("0-42.5%", "42.5-85%", "85-100%"))
+    var_name <- paste0(ratio, "BinnedFour")
+    df[[var_name]] = cut(df[[ratio]], breaks=c(0., 0.45, 0.666, 0.85, 2.), right=FALSE, labels=c("0-45%", "45-66.6%", "66.6-85%", "85-100%"))
+    var_name <- paste0(ratio, "Transformed")
+    df[[var_name]] = ifelse(df[[ratio]] < 0.8, -1, ((df[[ratio]] - 0.8) * 10) - 1)
+  }
+
+  for (ratio in baseline_ratios) {
+    var_name <- paste0(ratio, "Binned")
+    df[[var_name]] = cut(df[[ratio]], breaks=c(0., 0.7, 1., 1.5, Inf), right=TRUE, labels=c("0-70%", "70-100%", "100-150%", ">150%"))
+  }
+
+  df <- df %>% mutate(BedsVentAvailableBinned = factor(ifelse(BedsVentAvailable < 53, "Small", "Large"), levels=c("Small", "Large")))
+  df$BedsVentAvailableBaselineBinned = cut(df[["BedsVentAvailableBaseline"]], breaks=c(0, 50, 100, 1000), right=FALSE, labels=c("0 - 49", "50 - 99", "> 100"))
+  df <- df %>% mutate(MobilisationFactor = BedsVentAvailable / BedsVentAvailableBaseline)
+  df$MobilisationFactorBinned = cut(df[["MobilisationFactor"]], breaks=c(0, 1.5, 2.0, 10000.0), right=FALSE, labels=c("<150%", "150 - 200%", ">200%"))
+
+  df$VentRatioBinned40 <- relevel(df$VentRatioBinned40, "40-85%")
+  df$VentRatioBinned50 <- relevel(df$VentRatioBinned50, "50-85%")
+  df$VentRatioBinnedFinal <- relevel(df$VentRatioBinnedFinal, "45-85%")
+  df$VentRatioBinnedFour <- relevel(df$VentRatioBinnedFour, "45-66.6%")
+  df$VentRatioBinned425 <- relevel(df$VentRatioBinned425, "42.5-85%")
+  return(df)
+}
+
+df_primary_hdu_checkpoint <- setup_modelling_df(df_primary_hdu_linked)
+df_sens_with_still_on_unit_hdu_checkpoint <- setup_modelling_df(df_sens_with_still_on_unit_hdu_linked)
+df_sens_with_missing_fod_hdu_checkpoint <- setup_modelling_df(df_sens_with_missing_fod_hdu_linked)
+
+
+subset_df <- function(df) {
+  cols_to_keep=c(
+    'ethnicity5','ethnicity6','ethnicity','ageyear','sex','obese','isdiabetes','asthmarequiring','chronicheart','chronicrenal','chronicliver','chronicneurological','immunosuppressiondisease','hypertension','isdiabetes_clean','asthmarequiring_clean','chronicheart_clean','chronicrenal_clean','chronicliver_clean','chronicneurological_clean','immunosuppressiondisease_clean','hypertension_clean','VentRatio','VentRatioBinnedOld','icudatevalid','outcome','Region','VentRatioBaseline','BedsVentAvailableBaseline','BedsVentAvailable','VentRatioBinned40','trustcode','respiratory_and_asthma_clean','chronicrespiratory','chronicrespiratory_clean','BedsCriticalCareAvailableBaseline','BedsCriticalCareAvailable','CriticalCareRatio','week_icu','week_hosp','dex','Incident','CriticalCareDeltaOcc','CriticalCareDeltaOccUsing','max_BedsCriticalCareAvailable','min_BedsCriticalCareAvailable','Weighted_IMD','CriticalCareDeltaOccBaseline','CriticalCareDeltaOccBaselineUsing','VentDeltaOcc','VentDeltaOccUsing','VentDeltaOccBaseline','VentDeltaOccBaselineUsing','max_BedsVentAvailable','min_BedsVentAvailable','baseline_BedsCriticalCareAvailable','baseline_BedsVentAvailable','TrimmedVentDeltaOcc','TrimmedVentDeltaOccBaseline','TrimmedCriticalCareDeltaOcc','TrimmedCriticalCareDeltaOccBaseline','VentMinOcc','VentBaselineOcc','CriticalCareMinOcc','CriticalCareBaselineOcc','CriticalCareMobiFac','CriticalCareMobiFacBaseline','CriticalCareDeltaOccUsingProportion','CriticalCareDeltaOccBaselineUsingProportion'
+  )
+  df <- df %>% select(all_of(cols_to_keep)) %>% mutate(outcome = as.factor(outcome))
+  print(nrow(df))
+  return(df)
+}
+
+df_primary_hdu <- subset_df(df_primary_hdu_checkpoint)
+df_sens_with_still_on_unit_hdu <- subset_df(df_sens_with_still_on_unit_hdu_checkpoint)
+df_sens_with_missing_fod_hdu <- subset_df(df_sens_with_missing_fod_hdu_checkpoint)
+
+```
+
+```{r patientdays}
+patient_days <- df_primary_hdu_checkpoint %>% mutate(patientdays = pmax(as.numeric(finaloutcomedate - entry_date), 0)) %>% pull(patientdays) %>% sum()
+print(patient_days)
+sum(df_primary_hdu_checkpoint$outcome) / (patient_days / 1000)
+```
+
+## EDA
+
+```{r eda1, eval=FALSE}
+
+df_sitrep %>% 
+  mutate(MobilisedBedsCriticalCareOccupied = pmax(0, BedsCriticalCareOccupied - min_BedsCriticalCareAvailable)) %>%
+  group_by(Date) %>% 
+  summarise(
+    "Beds Total" = sum(BedsCriticalCareOccupied),
+    "Surge Capacity Beds" = sum(MobilisedBedsCriticalCareOccupied),
+  ) %>% 
+  gather(OccType, Occ, -Date) %>% 
+  ggplot(aes(x=Date, y=Occ, fill=OccType)) +
+    geom_bar(position="dodge", stat="identity") +
+    theme_minimal() +
+    labs(x="Date", y="Occupied Number of Beds", fill="Occupancy Type")
+
+# Change to proportion of trusts
+df_sitrep %>%
+  group_by(Date) %>%
+  summarise(UsingCriticalCareDeltaOcc = sum(CriticalCareDeltaOccUsing == "Yes", na.rm=T)) %>%
+  ggplot(aes(x=Date, y=UsingCriticalCareDeltaOcc)) + geom_bar(stat="identity") +
+    theme_minimal() +
+    labs(y = "Number of Trusts Utilising Mobilised Critical Care Beds")
+
+```
+
+
+## Missingness
+
+```{r}
+
+missingness_to_check <- c('trustcode','isdiabetes','asthmarequiring','chronicheart','chronicrenal','chronicneurological','immunosuppressiondisease','hypertension','chronicrespiratory')
+
+trust_missingness <- df_primary_hdu %>%
+  group_by(trustcode) %>%
+  select(all_of(missingness_to_check)) %>%
+  mutate_at(vars(-group_cols()), funs(replace(., .!="Yes" & .!="No", NA))) %>%
+  dplyr::summarise_all(~sum(is.na(.)) / (n() * length(missingness_to_check))) %>% 
+  transmute(trustcode, missingness = rowSums(.[-1]))
+
+trust_rows <- df_primary_hdu %>% group_by(trustcode) %>% dplyr::summarise(n_rows = n())
+
+plot_missingness <- inner_join(trust_rows, trust_missingness)
+
+plot_missingness <- plot_missingness %>% arrange(-missingness) %>% group_by(missingness) %>% dplyr::summarise(satisfying_rows = sum(n_rows), satisfying_trusts = n()) %>% mutate(n_rows = cumsum(satisfying_rows), n_trusts = cumsum(satisfying_trusts)) %>% mutate(p_rows = 100*(n_rows / max(n_rows)), p_trusts = 100*(n_trusts / max(n_trusts)))
+
+p<-plot_missingness %>%
+  ggplot() +
+    geom_line(aes(x=100 * missingness, y=p_rows, color="Percentage of Rows")) +
+    geom_line(aes(x=100 * missingness, y=p_trusts, color="Percentage of Trusts")) +
+    labs(x="Per Trust Missingness Threshold (%)", y="Percentage Below Threshold") +
+    theme_minimal() +
+    theme(legend.title=element_blank())
+print(p)
+ggsave("figures/missingness.png", p, width=15, height=10)
+ggsave("figures/missingness.pdf", p, width=15, height=10)
+
+df_primary_hdu_25 <- inner_join(trust_missingness %>% filter(missingness < 0.25) %>% select(trustcode), df_primary_hdu)
+df_primary_hdu_50 <- inner_join(trust_missingness %>% filter(missingness < 0.5) %>% select(trustcode), df_primary_hdu)
+df_primary_hdu_75 <- inner_join(trust_missingness %>% filter(missingness < 0.75) %>% select(trustcode), df_primary_hdu)
+
+# df_primary_hdu[c("ageyear", "week_hosp", "timetohdu")] <- scale(df_primary_hdu[c("ageyear", "week_hosp", "timetohdu")])
+```
+
+
+## Tables
+
+```{r tables1, eval=FALSE}
+
+x <- c("sex", "isdiabetes_clean", "respiratory_and_asthma_clean", "chronicheart_clean", "chronicrenal_clean", "chronicneurological_clean", "chronicliver_clean", "immunosuppressiondisease_clean", "hypertension_clean", "ethnicity6", "obese", "agecat", "ageyear", "Weighted_IMD", "outcome")
+tab <- CreateTableOne(data = df_primary_hdu_checkpoint %>% mutate(outcome = factor(outcome)) %>% select(all_of(x)))
+print(tab, formatOptions = list(big.mark = ","), nonnormal = c("ageyear"), cramVars = "hepato")
+write.csv(print(tab, nonnormal = c("ageyear", "Weighted_IMD"), showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE, printToggle = FALSE), "tableone.csv")
+
+tab2 <- CreateTableOne(data = df_primary_hdu_checkpoint %>% mutate(outcome = factor(outcome)) %>% select(all_of(x), "CriticalCareDeltaOccUsing"), strata="CriticalCareDeltaOccUsing", vars=x)
+write.csv(print(tab2, nonnormal = c("ageyear", "Weighted_IMD"), showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE, printToggle = FALSE), "tabletwo.csv")
+
+```
+
+## Export Modelling Data
+
+```{r exportdata}
+save(df_primary_hdu, df_primary_hdu_25, df_primary_hdu_50, df_primary_hdu_75, df_sens_with_missing_fod_hdu, df_sens_with_still_on_unit_hdu, file="data/modelling_dfs_hdu.RData")
+```
+
+```{r loaddata, eval=FALSE}
+load("data/modelling_dfs_hdu.RData")
+```
+
+```{r loadmodels}
+dirname <- "fits_do"
+fps <- list.files(dirname)
+for (fp in fps) {
+  load(paste0(dirname, "/", fp))
+}
+```
+
+
+## Models
+
+### Delta Occ Using
+
+```{r deltaoccusing_hdu}
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccusing_hdu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      CriticalCareDeltaOccUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccusing_hdu <- brm(
+  model_deltaoccusing_hdu,
+  data = df_primary_hdu, 
+  prior = priors,
+  family = brms::bernoulli(link = "logit"),
+  control = list(adapt_delta = 0.95),
+  iter=4000,
+  knots = list(
+    ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+  ),
+  chains=4, 
+  cores=4,
+  seed = 12345,
+  backend="cmdstanr"
+)
+
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccusingproportion_hdu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      CriticalCareDeltaOccUsingProportion + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccusingproportion_hdu <- brm(
+  model_deltaoccusingproportion_hdu,
+  data = df_primary_hdu, 
+  prior = priors,
+  family = brms::bernoulli(link = "logit"),
+  control = list(adapt_delta = 0.95),
+  iter=4000,
+  knots = list(
+    ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+  ),
+  chains=4, 
+  cores=4,
+  seed = 12345,
+  backend="cmdstanr"
+)
+
+
+priors <- prior(horseshoe(1))
+model_deltaoccusing_hdu_min <- bf(
+    outcome ~ CriticalCareDeltaOccUsing
+  )
+fit_deltaoccusing_hdu_min <- brm(
+  model_deltaoccusing_hdu_min,
+  data = df_primary_hdu, 
+  prior = priors,
+  family = brms::bernoulli(link = "logit"),
+  control = list(adapt_delta = 0.95),
+  iter=4000,
+  chains=4, 
+  cores=4,
+  seed = 12345,
+  backend="cmdstanr"
+)
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccusing_hdu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      CriticalCareDeltaOccUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccusing_hdu_25 <- brm(model_deltaoccusing_hdu,
+    data = df_primary_hdu_25, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+fit_deltaoccusing_hdu_50 <- brm(model_deltaoccusing_hdu,
+    data = df_primary_hdu_50, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+fit_deltaoccusing_hdu_75 <- brm(model_deltaoccusing_hdu,
+    data = df_primary_hdu_75, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccusing_hdu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      CriticalCareDeltaOccUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccusing_hdu_with_missing_fod <- brm(model_deltaoccusing_hdu,
+    data = df_sens_with_missing_fod_hdu, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+priors <- prior(horseshoe(1), nlpar="a")
+fit_deltaoccusing_hdu_with_still_on_unit <- brm(model_deltaoccusing_hdu,
+    data = df_sens_with_still_on_unit_hdu, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccusing_hdu_region <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      CriticalCareDeltaOccUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean + (1|Region)
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccusing_hdu_region <- brm(model_deltaoccusing_hdu_region,
+    data = df_primary_hdu, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccusing_hdu_imd <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      CriticalCareDeltaOccUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean + Weighted_IMD
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccusing_hdu_imd <- brm(model_deltaoccusing_hdu_imd,
+    data = df_primary_hdu, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+
+```
+
+### Delta Occ Using Baseline
+
+```{r deltaoccbaselineusing_hdu}
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccbaselineusing_hdu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      CriticalCareDeltaOccBaselineUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccbaselineusing_hdu <- brm(
+  model_deltaoccbaselineusing_hdu,
+  data = df_primary_hdu, 
+  prior = priors,
+  family = brms::bernoulli(link = "logit"),
+  control = list(adapt_delta = 0.95),
+  iter=4000,
+  knots = list(
+    ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+  ),
+  chains=4, 
+  cores=4,
+  seed = 12345,
+  backend="cmdstanr"
+)
+
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccbaselineusingproportion_hdu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      CriticalCareDeltaOccBaselineUsingProportion + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccbaselineusingproportion_hdu <- brm(
+  model_deltaoccbaselineusingproportion_hdu,
+  data = df_primary_hdu, 
+  prior = priors,
+  family = brms::bernoulli(link = "logit"),
+  control = list(adapt_delta = 0.95),
+  iter=4000,
+  knots = list(
+    ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+  ),
+  chains=4, 
+  cores=4,
+  seed = 12345,
+  backend="cmdstanr"
+)
+
+
+priors <- prior(horseshoe(1))
+model_deltaoccbaselineusing_hdu_min <- bf(
+    outcome ~ CriticalCareDeltaOccBaselineUsing
+  )
+fit_deltaoccbaselineusing_hdu_min <- brm(
+  model_deltaoccbaselineusing_hdu_min,
+  data = df_primary_hdu, 
+  prior = priors,
+  family = brms::bernoulli(link = "logit"),
+  control = list(adapt_delta = 0.95),
+  iter=4000,
+  chains=4, 
+  cores=4,
+  seed = 12345,
+  backend="cmdstanr"
+)
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccbaselineusing_hdu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      CriticalCareDeltaOccBaselineUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccbaselineusing_hdu_25 <- brm(model_deltaoccbaselineusing_hdu,
+    data = df_primary_hdu_25, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+fit_deltaoccbaselineusing_hdu_50 <- brm(model_deltaoccbaselineusing_hdu,
+    data = df_primary_hdu_50, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+fit_deltaoccbaselineusing_hdu_75 <- brm(model_deltaoccbaselineusing_hdu,
+    data = df_primary_hdu_75, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccbaselineusing_hdu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      CriticalCareDeltaOccBaselineUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccbaselineusing_hdu_with_missing_fod <- brm(model_deltaoccbaselineusing_hdu,
+    data = df_sens_with_missing_fod_hdu, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+priors <- prior(horseshoe(1), nlpar="a")
+fit_deltaoccbaselineusing_hdu_with_still_on_unit <- brm(model_deltaoccbaselineusing_hdu,
+    data = df_sens_with_still_on_unit_hdu, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccbaselineusing_hdu_region <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      CriticalCareDeltaOccBaselineUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean + (1|Region)
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccbaselineusing_hdu_region <- brm(model_deltaoccbaselineusing_hdu_region,
+    data = df_primary_hdu, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccbaselineusing_hdu_imd <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      CriticalCareDeltaOccBaselineUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean + Weighted_IMD
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccbaselineusing_hdu_imd <- brm(model_deltaoccbaselineusing_hdu_imd,
+    data = df_primary_hdu, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+
+```
+
+## Prior Checks
+
+```{r priorchecksmobifacbaseline, eval=FALSE}
+
+load("data/modelling_dfs_hdu.RData")
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccusing_hdu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      CriticalCareDeltaOccUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+
+#HS prior for 'a' group, with no. of degrees of freedom {1..n}
+priors_2 <- c(prior(horseshoe(1), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+priors_2b <- c(prior(horseshoe(3), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+priors_2c <- c(prior(horseshoe(5), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+priors_2d <- c(prior(horseshoe(7), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+#normal prior on 'a' group
+priors_3 <- c(prior(normal(0,1), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+fit_model <- function(prior_tmp) {
+  fit <- brm(model_deltaoccusing_hdu,
+             data = df_primary_hdu,
+             prior = prior_tmp,
+             family = brms::bernoulli(link = "logit"),
+             control = list(adapt_delta = 0.95),
+             iter=4000,
+              knots = list(
+                ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+              ),
+             chains=4,
+             cores=4,
+             seed = 12345,
+             backend = 'cmdstanr')
+  return(fit)
+}
+
+
+
+# this fits the model using ONLY prior, no data -- for the prior predictive checks
+fit_model_prior_only <- function(prior_tmp) {
+  fit <- brm(model_deltaoccusing_hdu,
+             data = df_primary_hdu,
+             prior = prior_tmp,
+             family = brms::bernoulli(link = "logit"),
+             control = list(adapt_delta = 0.95),
+             iter=4000,
+             knots = list(
+              ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+             ),
+             chains=4,
+             cores=4,
+             seed = 12345,
+             sample_prior = "only",
+             backend = 'cmdstanr')
+  return(fit)
+}
+
+fit_p1 <- fit_model(priors_2)
+fit_p2 <- fit_model(priors_2b)
+fit_p3 <- fit_model(priors_2c)
+fit_p4 <- fit_model(priors_2d)
+fit_p5 <- fit_model(priors_3)
+
+fit_p1_only <- fit_model_prior_only(priors_2)
+fit_p2_only <- fit_model_prior_only(priors_2b)
+fit_p3_only <- fit_model_prior_only(priors_2c)
+fit_p4_only <- fit_model_prior_only(priors_2d)
+fit_p5_only <- fit_model_prior_only(priors_3)
+
+
+```
+
+```{r priorchecksdegmobbaseline, eval=FALSE}
+
+load("data/modelling_dfs_hdu.RData")
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccbaselineusing_hdu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      CriticalCareDeltaOccBaselineUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+
+#HS prior for 'a' group, with no. of degrees of freedom {1..n}
+priors_2 <- c(prior(horseshoe(1), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+priors_2b <- c(prior(horseshoe(3), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+priors_2c <- c(prior(horseshoe(5), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+priors_2d <- c(prior(horseshoe(7), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+#normal prior on 'a' group
+priors_3 <- c(prior(normal(0,1), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+fit_model <- function(prior_tmp) {
+  fit <- brm(model_deltaoccbaselineusing_hdu,
+             data = df_primary_hdu,
+             prior = prior_tmp,
+             family = brms::bernoulli(link = "logit"),
+             control = list(adapt_delta = 0.95),
+             iter=4000,
+              knots = list(
+                ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+              ),
+             chains=4,
+             cores=4,
+             seed = 12345,
+             backend = 'cmdstanr')
+  return(fit)
+}
+
+
+
+# this fits the model using ONLY prior, no data -- for the prior predictive checks
+fit_model_prior_only <- function(prior_tmp) {
+  fit <- brm(model_deltaoccbaselineusing_hdu,
+             data = df_primary_hdu,
+             prior = prior_tmp,
+             family = brms::bernoulli(link = "logit"),
+             control = list(adapt_delta = 0.95),
+             iter=4000,
+             knots = list(
+              ageyear = as.vector(quantile(df_primary_hdu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+             ),
+             chains=4,
+             cores=4,
+             seed = 12345,
+             sample_prior = "only",
+             backend = 'cmdstanr')
+  return(fit)
+}
+
+fit_p1 <- fit_model(priors_2)
+fit_p2 <- fit_model(priors_2b)
+fit_p3 <- fit_model(priors_2c)
+fit_p4 <- fit_model(priors_2d)
+fit_p5 <- fit_model(priors_3)
+
+fit_p1_only <- fit_model_prior_only(priors_2)
+fit_p2_only <- fit_model_prior_only(priors_2b)
+fit_p3_only <- fit_model_prior_only(priors_2c)
+fit_p4_only <- fit_model_prior_only(priors_2d)
+fit_p5_only <- fit_model_prior_only(priors_3)
+
+
+```
+
+# ICU Only Modelling
+
+```{r setupforbettermodelling}
+
+ventdeltaoccusing_key <- df_sitrep %>% select(Date, trustcode = OrgCode, VentDeltaOccUsing) %>% spread(trustcode, VentDeltaOccUsing)
+ventdeltaoccbaselineusing_key <- df_sitrep %>% select(Date, trustcode = OrgCode, VentDeltaOccBaselineUsing) %>% spread(trustcode, VentDeltaOccBaselineUsing)
+
+proportion_ventdeltaocc <- function(start_date, end_date, trust) {
+  thing <- ventdeltaoccusing_key %>% filter(Date >= start_date & Date <= end_date + 1) %>% pull(trust)
+  return(sum(thing == "Yes", na.rm=T) / length(thing))
+}
+proportion_ventdeltaoccbaseline <- function(start_date, end_date, trust) {
+  thing <- ventdeltaoccbaselineusing_key %>% filter(Date >= start_date & Date <= end_date + 1) %>% pull(trust)
+  return(sum(thing == "Yes", na.rm=T) / length(thing))
+}
+
+
+setup_modelling_df <- function(df) {
+  
+  df <- df %>% filter(!is.na(VentRatio)) %>% filter(VentRatio != 0)
+
+  df <- df %>% rowwise() %>% mutate(VentDeltaOccUsingProportion = proportion_ventdeltaocc(entry_date, finaloutcomedate, trustcode)) %>% ungroup()
+  df <- df %>% rowwise() %>% mutate(VentDeltaOccBaselineUsingProportion = proportion_ventdeltaoccbaseline(entry_date, finaloutcomedate, trustcode)) %>% ungroup()
+
+  ratios <- c(
+    "CriticalCareRatio",
+    "VentRatio",
+    "GARatio",
+    "VentRatioC",
+    "GARatioC",
+    "VentRatioNC",
+    "GARatioNC",
+    "CriticalCareRatioU",
+    "VentRatioU",
+    "GARatioU"
+  )
+
+  baseline_ratios <- c(
+    "CriticalCareRatioBaseline",
+    "VentRatioBaseline",
+    "GARatioBaseline",
+    "VentRatioCBaseline",
+    "GARatioCBaseline",
+    "VentRatioNCBaseline",
+    "GARatioNCBaseline",
+    "CriticalCareRatioUBaseline",
+    "VentRatioUBaseline",
+    "GARatioUBaseline"
+  )
+
+  for (ratio in ratios) {
+    var_name <- paste0(ratio, "BinnedOld")
+    df[[var_name]] = cut(df[[ratio]], breaks=c(0., 0.85, 0.92, 2.), right=FALSE, labels=c("0-85%", "85-92%", "92-100%"))
+    var_name <- paste0(ratio, "Binned40")
+    df[[var_name]] = cut(df[[ratio]], breaks=c(0., 0.4, 0.85, 2.), right=FALSE, labels=c("0-40%", "40-85%", "85-100%"))
+    var_name <- paste0(ratio, "Binned50")
+    df[[var_name]] = cut(df[[ratio]], breaks=c(0., 0.5, 0.85, 2.), right=FALSE, labels=c("0-50%", "50-85%", "85-100%"))
+    var_name <- paste0(ratio, "BinnedFinal")
+    df[[var_name]] = cut(df[[ratio]], breaks=c(0., 0.45, 0.85, 2.), right=FALSE, labels=c("0-45%", "45-85%", "85-100%"))
+    var_name <- paste0(ratio, "BinnedTwo")
+    df[[var_name]] = cut(df[[ratio]], breaks=c(0., 0.85, 2.), right=FALSE, labels=c("0-85%", "85-100%"))
+    var_name <- paste0(ratio, "Binned425")
+    df[[var_name]] = cut(df[[ratio]], breaks=c(0., 0.425, 0.85, 2.), right=FALSE, labels=c("0-42.5%", "42.5-85%", "85-100%"))
+    var_name <- paste0(ratio, "BinnedFour")
+    df[[var_name]] = cut(df[[ratio]], breaks=c(0., 0.45, 0.666, 0.85, 2.), right=FALSE, labels=c("0-45%", "45-66.6%", "66.6-85%", "85-100%"))
+    var_name <- paste0(ratio, "Transformed")
+    df[[var_name]] = ifelse(df[[ratio]] < 0.8, -1, ((df[[ratio]] - 0.8) * 10) - 1)
+  }
+
+  for (ratio in baseline_ratios) {
+    var_name <- paste0(ratio, "Binned")
+    df[[var_name]] = cut(df[[ratio]], breaks=c(0., 0.7, 1., 1.5, Inf), right=TRUE, labels=c("0-70%", "70-100%", "100-150%", ">150%"))
+  }
+
+  df <- df %>% mutate(BedsVentAvailableBinned = factor(ifelse(BedsVentAvailable < 53, "Small", "Large"), levels=c("Small", "Large")))
+  df$BedsVentAvailableBaselineBinned = cut(df[["BedsVentAvailableBaseline"]], breaks=c(0, 50, 100, 1000), right=FALSE, labels=c("0 - 49", "50 - 99", "> 100"))
+  df <- df %>% mutate(MobilisationFactor = BedsVentAvailable / BedsVentAvailableBaseline)
+  df$MobilisationFactorBinned = cut(df[["MobilisationFactor"]], breaks=c(0, 1.5, 2.0, 10000.0), right=FALSE, labels=c("<150%", "150 - 200%", ">200%"))
+
+  df$VentRatioBinned40 <- relevel(df$VentRatioBinned40, "40-85%")
+  df$VentRatioBinned50 <- relevel(df$VentRatioBinned50, "50-85%")
+  df$VentRatioBinnedFinal <- relevel(df$VentRatioBinnedFinal, "45-85%")
+  df$VentRatioBinnedFour <- relevel(df$VentRatioBinnedFour, "45-66.6%")
+  df$VentRatioBinned425 <- relevel(df$VentRatioBinned425, "42.5-85%")
+  return(df)
+}
+
+df_primary_icu_checkpoint <- setup_modelling_df(df_primary_icu_linked)
+df_sens_with_still_on_unit_icu_checkpoint <- setup_modelling_df(df_sens_with_still_on_unit_icu_linked)
+df_sens_with_missing_fod_icu_checkpoint <- setup_modelling_df(df_sens_with_missing_fod_icu_linked)
+
+
+subset_df <- function(df) {
+  cols_to_keep=c(
+    'ethnicity5','ethnicity6','ethnicity','ageyear','sex','obese','isdiabetes','asthmarequiring','chronicheart','chronicrenal','chronicliver','chronicneurological','immunosuppressiondisease','hypertension','isdiabetes_clean','asthmarequiring_clean','chronicheart_clean','chronicrenal_clean','chronicliver_clean','chronicneurological_clean','immunosuppressiondisease_clean','hypertension_clean','VentRatio','VentRatioBinnedOld','icudatevalid','outcome','Region','VentRatioBaseline','BedsVentAvailableBaseline','BedsVentAvailable','VentRatioBinned40','trustcode','respiratory_and_asthma_clean','chronicrespiratory','chronicrespiratory_clean','BedsCriticalCareAvailableBaseline','BedsCriticalCareAvailable','CriticalCareRatio','week_icu','week_hosp','dex','Incident','CriticalCareDeltaOcc','CriticalCareDeltaOccUsing','max_BedsCriticalCareAvailable','min_BedsCriticalCareAvailable','Weighted_IMD','CriticalCareDeltaOccBaseline','CriticalCareDeltaOccBaselineUsing','VentDeltaOcc','VentDeltaOccUsing','VentDeltaOccBaseline','VentDeltaOccBaselineUsing','max_BedsVentAvailable','min_BedsVentAvailable','baseline_BedsCriticalCareAvailable','baseline_BedsVentAvailable','TrimmedVentDeltaOcc','TrimmedVentDeltaOccBaseline','TrimmedCriticalCareDeltaOcc','TrimmedCriticalCareDeltaOccBaseline','VentMinOcc','VentBaselineOcc','CriticalCareMinOcc','CriticalCareBaselineOcc','VentDeltaOccUsingProportion','VentDeltaOccBaselineUsingProportion'
+  )
+  df <- df %>% select(all_of(cols_to_keep)) %>% mutate(outcome = as.factor(outcome))
+  print(nrow(df))
+  return(df)
+}
+
+df_primary_icu <- subset_df(df_primary_icu_checkpoint)
+df_sens_with_still_on_unit_icu <- subset_df(df_sens_with_still_on_unit_icu_checkpoint)
+df_sens_with_missing_fod_icu <- subset_df(df_sens_with_missing_fod_icu_checkpoint)
+
+```
+
+```{r patientdays}
+patient_days <- df_primary_icu_checkpoint %>% mutate(patientdays = pmax(as.numeric(finaloutcomedate - entry_date), 0)) %>% pull(patientdays) %>% sum()
+print(patient_days)
+sum(df_primary_icu_checkpoint$outcome) / (patient_days / 1000)
+```
+
+## EDA
+
+```{r eda1, eval=FALSE}
+key <- tibble(dates = as.Date(c(date("2020-01-01"):date("2020-12-31")))) %>% mutate(weekno = as.numeric(strftime(dates, format="%V"))) %>% group_by(weekno) %>% summarise(weekstart = min(dates))
+df <- df_primary_icu %>% inner_join(key, by=c("week_hosp" = "weekno"))
+comorbs <- c("isdiabetes_clean", "respiratory_and_asthma_clean", "chronicheart_clean", "chronicrenal_clean", "chronicneurological_clean", "immunosuppressiondisease_clean", "hypertension_clean", "chronicliver_clean")
+df <- df %>% mutate(
+  comorbidity_count = df %>% select(all_of(comorbs)) %>% mutate_all(funs(as.numeric(.) - 1)) %>% rowSums()
+)
+p1 <- ggplot(trust_df_beds %>% mutate(weekno = as.numeric(strftime(Date, format="%V"))) %>% group_by(weekno) %>% summarise(weekstart = min(Date), VR = sum(BedsVentOccupied, na.rm=T) / sum(BedsVentAvailable, na.rm=T)) %>% ungroup() %>% filter(weekstart %in% df$weekstart), aes(x=weekstart, y=100*VR)) + 
+  geom_line(colour="red", size=1.25) + 
+  theme_minimal() + 
+  theme(axis.title.x = element_blank(), axis.text.x=element_blank(), axis.ticks.x = element_blank()) +
+  labs(x="Date of Admission (Week Commencing Date)", y="National Level Occupancy (Weekly, %)") +
+  scale_x_date(date_labels = "%d %b %y",date_breaks = "1 week", limits=c(min(df$weekstart) - 7, max(df$weekstart) + 7))
+p2 <- ggplot(df, aes(x=weekstart, y=ageyear)) + 
+  geom_boxplot(aes(group=weekstart)) + 
+  stat_summary(fun=mean, colour="red", geom="line", size=1.25) +
+  theme_minimal() + 
+  theme(axis.title.x = element_blank(), axis.text.x=element_blank(), axis.ticks.x = element_blank()) +
+  labs(x="Date of Admission (Week Commencing Date)", y="Age (Years)") +
+  scale_x_date(date_labels = "%d %b %y",date_breaks = "1 week", limits=c(min(df$weekstart) - 7, max(df$weekstart) + 7))
+p3 <- ggplot(df, aes(x=weekstart, y=comorbidity_count)) + 
+  geom_boxplot(aes(group=weekstart)) + 
+  stat_summary(fun=mean, colour="red", geom="line", size=1.25) +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(colour="", x="Date of Admission (Week Commencing Date)", y="Number of Comorbities") +
+  scale_x_date(date_labels = "%d %b %y",date_breaks = "1 week", limits=c(min(df$weekstart) - 7, max(df$weekstart) + 7))
+pa <- egg::ggarrange(p1, p2, p3, nrow=3, ncol=1)
+pa
+
+ggsave("figures/age_comorb_new.png", pa, width=15, height=15)
+ggsave("figures/age_comorb_new.pdf", pa, width=15, height=15)
+
+```
+
+```{r eda2, eval=FALSE}
+
+key <- tibble(dates = as.Date(c(date("2020-01-01"):date("2020-12-31")))) %>% mutate(weekno = as.numeric(strftime(dates, format="%V"))) %>% group_by(weekno) %>% summarise(weekstart = min(dates))
+df <- df_primary_icu_checkpoint %>% inner_join(key, by=c("week_hosp" = "weekno"))
+
+p1 <- ggplot(df, aes(x=weekstart, y=CriticalCareMobiFac)) + 
+  geom_boxplot(aes(group=weekstart)) + 
+  stat_summary(fun=mean, colour="red", geom="line", size=1.25) +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(x="Date of Admission (Week Commencing Date)", y="Mobilisation Factor Relative to Minimum Bed Availability in the Study Period") +
+  scale_x_date(date_labels = "%d %b %y",date_breaks = "1 week", limits=c(min(df$weekstart) - 7, max(df$weekstart) + 7))
+
+
+```
+
+
+## Missingness
+
+```{r}
+
+missingness_to_check <- c('trustcode','isdiabetes','asthmarequiring','chronicheart','chronicrenal','chronicneurological','immunosuppressiondisease','hypertension','chronicrespiratory')
+
+trust_missingness <- df_primary_icu %>%
+  group_by(trustcode) %>%
+  select(all_of(missingness_to_check)) %>%
+  mutate_at(vars(-group_cols()), funs(replace(., .!="Yes" & .!="No", NA))) %>%
+  dplyr::summarise_all(~sum(is.na(.)) / (n() * length(missingness_to_check))) %>% 
+  transmute(trustcode, missingness = rowSums(.[-1]))
+
+trust_rows <- df_primary_icu %>% group_by(trustcode) %>% dplyr::summarise(n_rows = n())
+
+plot_missingness <- inner_join(trust_rows, trust_missingness)
+
+plot_missingness <- plot_missingness %>% arrange(-missingness) %>% group_by(missingness) %>% dplyr::summarise(satisfying_rows = sum(n_rows), satisfying_trusts = n()) %>% mutate(n_rows = cumsum(satisfying_rows), n_trusts = cumsum(satisfying_trusts)) %>% mutate(p_rows = 100*(n_rows / max(n_rows)), p_trusts = 100*(n_trusts / max(n_trusts)))
+
+p<-plot_missingness %>%
+  ggplot() +
+    geom_line(aes(x=100 * missingness, y=p_rows, color="Percentage of Rows")) +
+    geom_line(aes(x=100 * missingness, y=p_trusts, color="Percentage of Trusts")) +
+    labs(x="Per Trust Missingness Threshold (%)", y="Percentage Below Threshold") +
+    theme_minimal() +
+    theme(legend.title=element_blank())
+print(p)
+ggsave("figures/missingness.png", p, width=15, height=10)
+ggsave("figures/missingness.pdf", p, width=15, height=10)
+
+df_primary_icu_25 <- inner_join(trust_missingness %>% filter(missingness < 0.25) %>% select(trustcode), df_primary_icu)
+df_primary_icu_50 <- inner_join(trust_missingness %>% filter(missingness < 0.5) %>% select(trustcode), df_primary_icu)
+df_primary_icu_75 <- inner_join(trust_missingness %>% filter(missingness < 0.75) %>% select(trustcode), df_primary_icu)
+
+# df_primary_icu[c("ageyear", "week_hosp", "timetohdu")] <- scale(df_primary_icu[c("ageyear", "week_hosp", "timetohdu")])
+```
+
+
+## Tables
+
+```{r tables1, eval=FALSE}
+
+x <- c("sex", "isdiabetes_clean", "respiratory_and_asthma_clean", "chronicheart_clean", "chronicrenal_clean", "chronicneurological_clean", "chronicliver_clean", "immunosuppressiondisease_clean", "hypertension_clean", "ethnicity6", "obese", "agecat", "ageyear", "Weighted_IMD", "outcome")
+tab <- CreateTableOne(data = df_primary_icu_checkpoint %>% mutate(outcome = factor(outcome)) %>% select(all_of(x)))
+print(tab, formatOptions = list(big.mark = ","), nonnormal = c("ageyear"), cramVars = "hepato")
+write.csv(print(tab, nonnormal = c("ageyear", "Weighted_IMD"), showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE, printToggle = FALSE), "tableone.csv")
+
+tab2 <- CreateTableOne(data = df_primary_icu_checkpoint %>% mutate(outcome = factor(outcome)) %>% select(all_of(x), "CriticalCareDeltaOccUsing"), strata="CriticalCareDeltaOccUsing", vars=x)
+write.csv(print(tab2, nonnormal = c("ageyear", "Weighted_IMD"), showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE, printToggle = FALSE), "tabletwo.csv")
+
+```
+
+## Export Modelling Data
+
+```{r exportdata}
+save(df_primary_icu, df_primary_icu_25, df_primary_icu_50, df_primary_icu_75, df_sens_with_missing_fod_icu, df_sens_with_still_on_unit_icu, file="data/modelling_dfs_icu.RData")
+```
+
+```{r loaddata, eval=FALSE}
+load("data/modelling_dfs_icu.RData")
+```
+
+## Models
+
+### Delta Occ Using
+
+```{r deltaoccusing_icu}
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccusing_icu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      VentDeltaOccUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccusing_icu <- brm(
+  model_deltaoccusing_icu,
+  data = df_primary_icu, 
+  prior = priors,
+  family = brms::bernoulli(link = "logit"),
+  control = list(adapt_delta = 0.95),
+  iter=4000,
+  knots = list(
+    ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+  ),
+  chains=4, 
+  cores=4,
+  seed = 12345,
+  backend="cmdstanr"
+)
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccusingproportion_icu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      VentDeltaOccUsingProportion + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccusingproportion_icu <- brm(
+  model_deltaoccusingproportion_icu,
+  data = df_primary_icu, 
+  prior = priors,
+  family = brms::bernoulli(link = "logit"),
+  control = list(adapt_delta = 0.95),
+  iter=4000,
+  knots = list(
+    ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+  ),
+  chains=4, 
+  cores=4,
+  seed = 12345,
+  backend="cmdstanr"
+)
+
+
+priors <- prior(horseshoe(1))
+model_deltaoccusing_icu_min <- bf(
+    outcome ~ VentDeltaOccUsing
+  )
+fit_deltaoccusing_icu_min <- brm(
+  model_deltaoccusing_icu_min,
+  data = df_primary_icu, 
+  prior = priors,
+  family = brms::bernoulli(link = "logit"),
+  control = list(adapt_delta = 0.95),
+  iter=4000,
+  chains=4, 
+  cores=4,
+  seed = 12345,
+  backend="cmdstanr"
+)
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccusing_icu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      VentDeltaOccUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccusing_icu_25 <- brm(model_deltaoccusing_icu,
+    data = df_primary_icu_25, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+fit_deltaoccusing_icu_50 <- brm(model_deltaoccusing_icu,
+    data = df_primary_icu_50, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+fit_deltaoccusing_icu_75 <- brm(model_deltaoccusing_icu,
+    data = df_primary_icu_75, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccusing_icu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      VentDeltaOccUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccusing_icu_with_missing_fod <- brm(model_deltaoccusing_icu,
+    data = df_sens_with_missing_fod_icu, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+priors <- prior(horseshoe(1), nlpar="a")
+fit_deltaoccusing_icu_with_still_on_unit <- brm(model_deltaoccusing_icu,
+    data = df_sens_with_still_on_unit_icu, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccusing_icu_region <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      VentDeltaOccUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean + (1|Region)
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccusing_icu_region <- brm(model_deltaoccusing_icu_region,
+    data = df_primary_icu, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccusing_icu_imd <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      VentDeltaOccUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean + Weighted_IMD
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccusing_icu_imd <- brm(model_deltaoccusing_icu_imd,
+    data = df_primary_icu, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+
+```
+
+
+### Delta Occ Using Baseline
+
+```{r deltaoccbaselineusing_icu}
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccbaselineusing_icu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      VentDeltaOccBaselineUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccbaselineusing_icu <- brm(
+  model_deltaoccbaselineusing_icu,
+  data = df_primary_icu, 
+  prior = priors,
+  family = brms::bernoulli(link = "logit"),
+  control = list(adapt_delta = 0.95),
+  iter=4000,
+  knots = list(
+    ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+  ),
+  chains=4, 
+  cores=4,
+  seed = 12345,
+  backend="cmdstanr"
+)
+
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccbaselineusingproportion_icu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      VentDeltaOccBaselineUsingProportion + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccbaselineusingproportion_icu <- brm(
+  model_deltaoccbaselineusingproportion_icu,
+  data = df_primary_icu, 
+  prior = priors,
+  family = brms::bernoulli(link = "logit"),
+  control = list(adapt_delta = 0.95),
+  iter=4000,
+  knots = list(
+    ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+  ),
+  chains=4, 
+  cores=4,
+  seed = 12345,
+  backend="cmdstanr"
+)
+
+priors <- prior(horseshoe(1))
+model_deltaoccbaselineusing_icu_min <- bf(
+    outcome ~ VentDeltaOccBaselineUsing
+  )
+fit_deltaoccbaselineusing_icu_min <- brm(
+  model_deltaoccbaselineusing_icu_min,
+  data = df_primary_icu, 
+  prior = priors,
+  family = brms::bernoulli(link = "logit"),
+  control = list(adapt_delta = 0.95),
+  iter=4000,
+  chains=4, 
+  cores=4,
+  seed = 12345,
+  backend="cmdstanr"
+)
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccbaselineusing_icu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      VentDeltaOccBaselineUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccbaselineusing_icu_25 <- brm(model_deltaoccbaselineusing_icu,
+    data = df_primary_icu_25, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+fit_deltaoccbaselineusing_icu_50 <- brm(model_deltaoccbaselineusing_icu,
+    data = df_primary_icu_50, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+fit_deltaoccbaselineusing_icu_75 <- brm(model_deltaoccbaselineusing_icu,
+    data = df_primary_icu_75, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccbaselineusing_icu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      VentDeltaOccBaselineUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccbaselineusing_icu_with_missing_fod <- brm(model_deltaoccbaselineusing_icu,
+    data = df_sens_with_missing_fod_icu, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+priors <- prior(horseshoe(1), nlpar="a")
+fit_deltaoccbaselineusing_icu_with_still_on_unit <- brm(model_deltaoccbaselineusing_icu,
+    data = df_sens_with_still_on_unit_icu, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccbaselineusing_icu_region <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      VentDeltaOccBaselineUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean + (1|Region)
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccbaselineusing_icu_region <- brm(model_deltaoccbaselineusing_icu_region,
+    data = df_primary_icu, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccbaselineusing_icu_imd <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      VentDeltaOccBaselineUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean + Weighted_IMD
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+fit_deltaoccbaselineusing_icu_imd <- brm(model_deltaoccbaselineusing_icu_imd,
+    data = df_primary_icu, 
+    prior = priors,
+    family = brms::bernoulli(link = "logit"),
+    control = list(adapt_delta = 0.95),
+    iter=4000,
+    knots = list(
+      ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+    ),
+    chains=4, 
+    cores=4,
+    seed = 12345,
+    backend="cmdstanr"
+)
+
+```
+
+## Prior Checks
+
+```{r priorchecksmobifacbaseline, eval=FALSE}
+
+load("data/modelling_dfs_icu.RData")
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccusing_icu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      VentDeltaOccUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+
+#HS prior for 'a' group, with no. of degrees of freedom {1..n}
+priors_2 <- c(prior(horseshoe(1), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+priors_2b <- c(prior(horseshoe(3), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+priors_2c <- c(prior(horseshoe(5), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+priors_2d <- c(prior(horseshoe(7), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+#normal prior on 'a' group
+priors_3 <- c(prior(normal(0,1), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+fit_model <- function(prior_tmp) {
+  fit <- brm(model_deltaoccusing_icu,
+             data = df_primary_icu,
+             prior = prior_tmp,
+             family = brms::bernoulli(link = "logit"),
+             control = list(adapt_delta = 0.95),
+             iter=4000,
+              knots = list(
+                ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+              ),
+             chains=4,
+             cores=4,
+             seed = 12345,
+             backend = 'cmdstanr')
+  return(fit)
+}
+
+# this fits the model using ONLY prior, no data -- for the prior predictive checks
+fit_model_prior_only <- function(prior_tmp) {
+  fit <- brm(model_deltaoccusing_icu,
+             data = df_primary_icu,
+             prior = prior_tmp,
+             family = brms::bernoulli(link = "logit"),
+             control = list(adapt_delta = 0.95),
+             iter=4000,
+             knots = list(
+              ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+             ),
+             chains=4,
+             cores=4,
+             seed = 12345,
+             sample_prior = "only",
+             backend = 'cmdstanr')
+  return(fit)
+}
+
+fit_p1 <- fit_model(priors_2)
+fit_p2 <- fit_model(priors_2b)
+fit_p3 <- fit_model(priors_2c)
+fit_p4 <- fit_model(priors_2d)
+fit_p5 <- fit_model(priors_3)
+
+fit_p1_only <- fit_model_prior_only(priors_2)
+fit_p2_only <- fit_model_prior_only(priors_2b)
+fit_p3_only <- fit_model_prior_only(priors_2c)
+fit_p4_only <- fit_model_prior_only(priors_2d)
+fit_p5_only <- fit_model_prior_only(priors_3)
+
+
+```
+
+```{r priorchecksdegmobbaseline, eval=FALSE}
+
+load("data/modelling_dfs_icu.RData")
+
+priors <- prior(horseshoe(1), nlpar="a")
+model_deltaoccbaselineusing_icu <- bf(
+    outcome ~ a + splines, nl=TRUE
+  ) + lf(
+    a ~ (1|trustcode) + sex + isdiabetes_clean + respiratory_and_asthma_clean + 
+      chronicheart_clean + chronicrenal_clean + chronicneurological_clean +
+      immunosuppressiondisease_clean + hypertension_clean +
+      VentDeltaOccBaselineUsing + (1|ethnicity6) + (1|obese) + week_hosp + chronicliver_clean
+  ) + lf(
+    splines ~ 0 + s(ageyear, k=4, bs="cr")
+  )
+
+#HS prior for 'a' group, with no. of degrees of freedom {1..n}
+priors_2 <- c(prior(horseshoe(1), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+priors_2b <- c(prior(horseshoe(3), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+priors_2c <- c(prior(horseshoe(5), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+priors_2d <- c(prior(horseshoe(7), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+#normal prior on 'a' group
+priors_3 <- c(prior(normal(0,1), nlpar = "a"),
+              prior(normal(0,1),class="b", nlpar = "splines", coef=""))
+
+fit_model <- function(prior_tmp) {
+  fit <- brm(model_deltaoccbaselineusing_icu,
+             data = df_primary_icu,
+             prior = prior_tmp,
+             family = brms::bernoulli(link = "logit"),
+             control = list(adapt_delta = 0.95),
+             iter=4000,
+              knots = list(
+                ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+              ),
+             chains=4,
+             cores=4,
+             seed = 12345,
+             backend = 'cmdstanr')
+  return(fit)
+}
+
+# this fits the model using ONLY prior, no data -- for the prior predictive checks
+fit_model_prior_only <- function(prior_tmp) {
+  fit <- brm(model_deltaoccbaselineusing_icu,
+             data = df_primary_icu,
+             prior = prior_tmp,
+             family = brms::bernoulli(link = "logit"),
+             control = list(adapt_delta = 0.95),
+             iter=4000,
+             knots = list(
+              ageyear = as.vector(quantile(df_primary_icu$ageyear, probs=c(0.05, 0.35, 0.65, 0.95)))
+             ),
+             chains=4,
+             cores=4,
+             seed = 12345,
+             sample_prior = "only",
+             backend = 'cmdstanr')
+  return(fit)
+}
+
+fit_p1 <- fit_model(priors_2)
+fit_p2 <- fit_model(priors_2b)
+fit_p3 <- fit_model(priors_2c)
+fit_p4 <- fit_model(priors_2d)
+fit_p5 <- fit_model(priors_3)
+
+fit_p1_only <- fit_model_prior_only(priors_2)
+fit_p2_only <- fit_model_prior_only(priors_2b)
+fit_p3_only <- fit_model_prior_only(priors_2c)
+fit_p4_only <- fit_model_prior_only(priors_2d)
+fit_p5_only <- fit_model_prior_only(priors_3)
+
+
+```
+
+
+## Sensitivity Tables
+
+```{r}
+calc_intervals = function(fit_, ci1_fun=c("eti", "hdi"), ci1=0.89, ci2_fun=c("eti", "hdi"), ci2=0.89, two_cis=FALSE, or=TRUE, save_cis=FALSE, custom_scale=NULL, cols=c("b_a_CriticalCareDegMobMin"),...) {
+  
+  data <- exp(tibble(as.data.frame(fit_$fit)[cols]))
+
+  # Determine whether to use eti or hdi function
+  ci1_FUN = match.arg(ci1_fun)
+  ci1_FUN = match.fun(ci1_fun)
+  ci2_FUN = match.arg(ci2_fun)
+  ci2_FUN = match.fun(ci2_fun)
+  
+  if (ci1 < ci2) {
+    ci_fun_temp <- ci1_fun
+    ci1_fun <- ci2_fun
+    ci2_fun <- ci_fun_temp
+    ci_temp <- ci1
+    ci1 <- ci2
+    ci2 <- ci_temp
+  }
+  
+  dens = map_df(
+    data, ~ {
+      d = density(.x, na.rm=TRUE)
+      tibble(x=d$x, y=d$y)
+    },
+    .id="name"
+  )
+  
+  custom_scale = cols
+  
+  # Set width of median line
+  # Get credible interval width and median
+  cred.int = data %>% 
+    pivot_longer(cols=everything()) %>% 
+    group_by(name) %>% 
+    dplyr::summarise(
+      CI1=list(ci1_FUN(value, ci=ci1)),
+      CI2=list(ci2_FUN(value, ci=ci2)),
+      m=median(value, na.rm=TRUE)) %>% 
+    unnest_wider(CI1) %>%
+    select(name, CI1=CI, CI1_low=CI_low, CI1_high=CI_high, CI2, m) %>%
+    unnest_wider(CI2) %>%
+    select(name, CI1, CI1_low, CI1_high, CI2=CI, CI2_low=CI_low, CI2_high=CI_high, m)
+  
+  if (save_cis == TRUE) {
+    if (!is.null(custom_scale)) {
+      out = tibble(name=custom_scale) %>% inner_join(cred.int)
+    } else {
+      out = cred.int
+    }
+    write.csv(out, "cis.csv", na="NA")
+    return(out)
+  } else {
+    return(cred.int)
+  }
+  
+}
+
+out <- bind_rows(
+  calc_intervals(fit_deltaoccusingproportion_hdu, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_CriticalCareDeltaOccUsingProportion")) %>% mutate(model="HDU"),
+  calc_intervals(fit_deltaoccbaselineusingproportion_hdu, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_CriticalCareDeltaOccBaselineUsingProportion")) %>% mutate(model="HDU baseline"),
+  calc_intervals(fit_deltaoccusingproportion_icu, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_VentDeltaOccUsingProportion")) %>% mutate(model="ICU"),
+  calc_intervals(fit_deltaoccbaselineusingproportion_icu, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_VentDeltaOccBaselineUsingProportion")) %>% mutate(model="ICU baseline"),
+)
+write.csv(out, "sens_deltaoccusingproportion.csv", na="NA")
+
+
+out <- bind_rows(
+  calc_intervals(fit_deltaoccusing_hdu, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_CriticalCareDeltaOccUsingYes")) %>% mutate(model="Primary"),
+  calc_intervals(fit_deltaoccusing_hdu_min, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_CriticalCareDeltaOccUsingYes")) %>% mutate(model="Minimal"),
+  calc_intervals(fit_deltaoccusing_hdu_75, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_CriticalCareDeltaOccUsingYes")) %>% mutate(model="75 Missing"),
+  calc_intervals(fit_deltaoccusing_hdu_50, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_CriticalCareDeltaOccUsingYes")) %>% mutate(model="50 Missing"),
+  calc_intervals(fit_deltaoccusing_hdu_25, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_CriticalCareDeltaOccUsingYes")) %>% mutate(model="25 Missing"),
+  calc_intervals(fit_deltaoccusing_hdu_imd, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_CriticalCareDeltaOccUsingYes")) %>% mutate(model="Weighted IMD"),
+  calc_intervals(fit_deltaoccusing_hdu_region, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_CriticalCareDeltaOccUsingYes")) %>% mutate(model="Region"),
+  calc_intervals(fit_deltaoccusing_hdu_with_missing_fod, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_CriticalCareDeltaOccUsingYes")) %>% mutate(model="Missing Final Outcome Date"),
+  calc_intervals(fit_deltaoccusing_hdu_with_still_on_unit, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_CriticalCareDeltaOccUsingYes")) %>% mutate(model="Still on Unit"),
+)
+write.csv(out, "sens_deltaoccusing_hdu.csv", na="NA")
+
+out <- bind_rows(
+  calc_intervals(fit_deltaoccbaselineusing_hdu, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_CriticalCareDeltaOccBaselineUsingYes")) %>% mutate(model="Primary"),
+  calc_intervals(fit_deltaoccbaselineusing_hdu_min, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_CriticalCareDeltaOccBaselineUsingYes")) %>% mutate(model="Minimal"),
+  calc_intervals(fit_deltaoccbaselineusing_hdu_75, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_CriticalCareDeltaOccBaselineUsingYes")) %>% mutate(model="75 Missing"),
+  calc_intervals(fit_deltaoccbaselineusing_hdu_50, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_CriticalCareDeltaOccBaselineUsingYes")) %>% mutate(model="50 Missing"),
+  calc_intervals(fit_deltaoccbaselineusing_hdu_25, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_CriticalCareDeltaOccBaselineUsingYes")) %>% mutate(model="25 Missing"),
+  calc_intervals(fit_deltaoccbaselineusing_hdu_imd, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_CriticalCareDeltaOccBaselineUsingYes")) %>% mutate(model="Weighted IMD"),
+  calc_intervals(fit_deltaoccbaselineusing_hdu_region, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_CriticalCareDeltaOccBaselineUsingYes")) %>% mutate(model="Region"),
+  calc_intervals(fit_deltaoccbaselineusing_hdu_with_missing_fod, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_CriticalCareDeltaOccBaselineUsingYes")) %>% mutate(model="Missing Final Outcome Date"),
+  calc_intervals(fit_deltaoccbaselineusing_hdu_with_still_on_unit, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_CriticalCareDeltaOccBaselineUsingYes")) %>% mutate(model="Still on Unit"),
+)
+write.csv(out, "sens_deltaoccbaselineusing_hdu.csv", na="NA")
+
+out <- bind_rows(
+  calc_intervals(fit_deltaoccusing_icu, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_VentDeltaOccUsingYes")) %>% mutate(model="Primary"),
+  calc_intervals(fit_deltaoccusing_icu_min, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_VentDeltaOccUsingYes")) %>% mutate(model="Minimal"),
+  calc_intervals(fit_deltaoccusing_icu_75, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_VentDeltaOccUsingYes")) %>% mutate(model="75 Missing"),
+  calc_intervals(fit_deltaoccusing_icu_50, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_VentDeltaOccUsingYes")) %>% mutate(model="50 Missing"),
+  calc_intervals(fit_deltaoccusing_icu_25, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_VentDeltaOccUsingYes")) %>% mutate(model="25 Missing"),
+  calc_intervals(fit_deltaoccusing_icu_imd, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_VentDeltaOccUsingYes")) %>% mutate(model="Weighted IMD"),
+  calc_intervals(fit_deltaoccusing_icu_region, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_VentDeltaOccUsingYes")) %>% mutate(model="Region"),
+  calc_intervals(fit_deltaoccusing_icu_with_missing_fod, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_VentDeltaOccUsingYes")) %>% mutate(model="Missing Final Outcome Date"),
+  calc_intervals(fit_deltaoccusing_icu_with_still_on_unit, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_VentDeltaOccUsingYes")) %>% mutate(model="Still on Unit"),
+)
+write.csv(out, "sens_deltaoccusing_icu.csv", na="NA")
+
+out <- bind_rows(
+  calc_intervals(fit_deltaoccbaselineusing_icu, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_VentDeltaOccBaselineUsingYes")) %>% mutate(model="Primary"),
+  calc_intervals(fit_deltaoccbaselineusing_icu_min, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_VentDeltaOccBaselineUsingYes")) %>% mutate(model="Minimal"),
+  calc_intervals(fit_deltaoccbaselineusing_icu_75, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_VentDeltaOccBaselineUsingYes")) %>% mutate(model="75 Missing"),
+  calc_intervals(fit_deltaoccbaselineusing_icu_50, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_VentDeltaOccBaselineUsingYes")) %>% mutate(model="50 Missing"),
+  calc_intervals(fit_deltaoccbaselineusing_icu_25, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_VentDeltaOccBaselineUsingYes")) %>% mutate(model="25 Missing"),
+  calc_intervals(fit_deltaoccbaselineusing_icu_imd, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_VentDeltaOccBaselineUsingYes")) %>% mutate(model="Weighted IMD"),
+  calc_intervals(fit_deltaoccbaselineusing_icu_region, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_VentDeltaOccBaselineUsingYes")) %>% mutate(model="Region"),
+  calc_intervals(fit_deltaoccbaselineusing_icu_with_missing_fod, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_VentDeltaOccBaselineUsingYes")) %>% mutate(model="Missing Final Outcome Date"),
+  calc_intervals(fit_deltaoccbaselineusing_icu_with_still_on_unit, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c("b_a_VentDeltaOccBaselineUsingYes")) %>% mutate(model="Still on Unit"),
+)
+write.csv(out, "sens_deltaoccbaselineusing_icu.csv", na="NA")
+
+```
+
+
+## Full Model Specs
+
+```{r forestplots, eval=FALSE}
+
+calc_intervals(fit_deltaoccusing_icu, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c(
+  "b_a_Intercept",
+  "b_a_VentDeltaOccUsingYes",
+  "b_a_sexMale",
+  "b_a_isdiabetes_cleanYes",
+  "b_a_respiratory_and_asthma_cleanYes",
+  "b_a_chronicheart_cleanYes",
+  "b_a_chronicrenal_cleanYes",
+  "b_a_chronicneurological_cleanYes",
+  "b_a_chronicliver_cleanYes",
+  "b_a_immunosuppressiondisease_cleanYes",
+  "b_a_hypertension_cleanYes",
+  "b_a_week_hosp",
+  "r_obese__a[Obese,Intercept]",
+  "r_obese__a[Non-Obese,Intercept]",
+  "r_obese__a[Missing,Intercept]",
+  "r_ethnicity6__a[White,Intercept]",
+  "r_ethnicity6__a[Asian.Subcontinent,Intercept]",
+  "r_ethnicity6__a[Asian.(Other),Intercept]",
+  "r_ethnicity6__a[Black,Intercept]",
+  "r_ethnicity6__a[Mixed,Intercept]",
+  "r_ethnicity6__a[Other,Intercept]",
+  "r_ethnicity6__a[Missing,Intercept]"
+))
+
+calc_intervals(fit_deltaoccusingproportion_icu, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c(
+  "b_a_Intercept",
+  "b_a_VentDeltaOccUsingProportion",
+  "b_a_sexMale",
+  "b_a_isdiabetes_cleanYes",
+  "b_a_respiratory_and_asthma_cleanYes",
+  "b_a_chronicheart_cleanYes",
+  "b_a_chronicrenal_cleanYes",
+  "b_a_chronicneurological_cleanYes",
+  "b_a_chronicliver_cleanYes",
+  "b_a_immunosuppressiondisease_cleanYes",
+  "b_a_hypertension_cleanYes",
+  "b_a_week_hosp",
+  "r_obese__a[Obese,Intercept]",
+  "r_obese__a[Non-Obese,Intercept]",
+  "r_obese__a[Missing,Intercept]",
+  "r_ethnicity6__a[White,Intercept]",
+  "r_ethnicity6__a[Asian.Subcontinent,Intercept]",
+  "r_ethnicity6__a[Asian.(Other),Intercept]",
+  "r_ethnicity6__a[Black,Intercept]",
+  "r_ethnicity6__a[Mixed,Intercept]",
+  "r_ethnicity6__a[Other,Intercept]",
+  "r_ethnicity6__a[Missing,Intercept]"
+))
+
+calc_intervals(fit_deltaoccusing_hdu, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c(
+  "b_a_Intercept",
+  "b_a_CriticalCareDeltaOccUsingYes",
+  "b_a_sexMale",
+  "b_a_isdiabetes_cleanYes",
+  "b_a_respiratory_and_asthma_cleanYes",
+  "b_a_chronicheart_cleanYes",
+  "b_a_chronicrenal_cleanYes",
+  "b_a_chronicneurological_cleanYes",
+  "b_a_chronicliver_cleanYes",
+  "b_a_immunosuppressiondisease_cleanYes",
+  "b_a_hypertension_cleanYes",
+  "b_a_week_hosp",
+  "r_obese__a[Obese,Intercept]",
+  "r_obese__a[Non-Obese,Intercept]",
+  "r_obese__a[Missing,Intercept]",
+  "r_ethnicity6__a[White,Intercept]",
+  "r_ethnicity6__a[Asian.Subcontinent,Intercept]",
+  "r_ethnicity6__a[Asian.(Other),Intercept]",
+  "r_ethnicity6__a[Black,Intercept]",
+  "r_ethnicity6__a[Mixed,Intercept]",
+  "r_ethnicity6__a[Other,Intercept]",
+  "r_ethnicity6__a[Missing,Intercept]"
+))
+
+
+calc_intervals(fit_deltaoccusingproportion_hdu, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c(
+  "b_a_Intercept",
+  "b_a_CriticalCareDeltaOccUsingProportion",
+  "b_a_sexMale",
+  "b_a_isdiabetes_cleanYes",
+  "b_a_respiratory_and_asthma_cleanYes",
+  "b_a_chronicheart_cleanYes",
+  "b_a_chronicrenal_cleanYes",
+  "b_a_chronicneurological_cleanYes",
+  "b_a_chronicliver_cleanYes",
+  "b_a_immunosuppressiondisease_cleanYes",
+  "b_a_hypertension_cleanYes",
+  "b_a_week_hosp",
+  "r_obese__a[Obese,Intercept]",
+  "r_obese__a[Non-Obese,Intercept]",
+  "r_obese__a[Missing,Intercept]",
+  "r_ethnicity6__a[White,Intercept]",
+  "r_ethnicity6__a[Asian.Subcontinent,Intercept]",
+  "r_ethnicity6__a[Asian.(Other),Intercept]",
+  "r_ethnicity6__a[Black,Intercept]",
+  "r_ethnicity6__a[Mixed,Intercept]",
+  "r_ethnicity6__a[Other,Intercept]",
+  "r_ethnicity6__a[Missing,Intercept]"
+))
+
+```
+
+## Plotting
+
+```{r}
+
+samples_df <- tibble(as.data.frame(fit_deltaocc_icu$fit)[c(
+  "b_a_Intercept",
+  "b_a_VentDeltaOcc",
+  "b_a_sexMale",
+  "b_a_isdiabetes_cleanYes",
+  "b_a_respiratory_and_asthma_cleanYes",
+  "b_a_chronicheart_cleanYes",
+  "b_a_chronicrenal_cleanYes",
+  "b_a_chronicneurological_cleanYes",
+  "b_a_chronicliver_cleanYes",
+  "b_a_immunosuppressiondisease_cleanYes",
+  "b_a_hypertension_cleanYes",
+  "b_a_week_hosp"
+)]) %>%
+  select(
+    "Intercept" = `b_a_Intercept`,
+    "Delta Occupancy (ICU)" = `b_a_VentDeltaOcc`,
+    "Male" = `b_a_sexMale`,
+    "Diabetes" = `b_a_isdiabetes_cleanYes`,
+    "Chronic Respiratory Disease(s)" = `b_a_respiratory_and_asthma_cleanYes`,
+    "Chronic Heart Disease" = `b_a_chronicheart_cleanYes`,
+    "Chronic Renal Disease" = `b_a_chronicrenal_cleanYes`,
+    "Chronic Neurological Disease" = `b_a_chronicneurological_cleanYes`,
+    "Chronic Liver Disease" = `b_a_chronicliver_cleanYes`,
+    "Immunosuppressive Disease" = `b_a_immunosuppressiondisease_cleanYes`,
+    "Hypertension" = `b_a_hypertension_cleanYes`,
+    "Week of Admission" = `b_a_week_hosp`
+  )
+
+samples_df_exp <- samples_df %>% exp() %>% gather(name, value) %>% mutate(
+  name = factor(name, levels = rev(c(
+    "Intercept",
+    "Delta Occupancy (ICU)",
+    "Male",
+    "Diabetes",
+    "Chronic Respiratory Disease(s)",
+    "Chronic Heart Disease",
+    "Chronic Renal Disease",
+    "Chronic Neurological Disease",
+    "Chronic Liver Disease",
+    "Immunosuppressive Disease",
+    "Hypertension",
+    "Week of Admission"
+  )))
+)
+
+p1 <- ggplot(samples_df_exp %>% filter(name == "Intercept") %>% mutate(name = "")) +
+  geom_vline(aes(xintercept=1)) +
+  stat_interval(aes(x=value, y=name), .width=c(0.5, 0.8, 0.9, 0.95, 0.99)) +
+  stat_summary(aes(x=value, y=name, colour=" Median"), fun=median, geom="point", size=5, shape=15) +
+  theme_minimal() +
+  guides(colour = guide_legend(nrow = 1)) +
+  scale_color_brewer(name="Credible Interval", labels=c("Median", "50%", "80%", "90%", "95%", "99%"), direction=-1) +
+  theme(plot.title.position = "plot", axis.title.x=element_blank(), axis.title.y=element_blank(), legend.position="top") +
+  labs(title="Intercept")
+print(p1)
+
+p2 <- ggplot(samples_df_exp %>% filter(!name %in% c("Intercept", "Week of Admission"))) +
+  geom_vline(aes(xintercept=1)) +
+  stat_interval(aes(x=value, y=name), .width=c(0.5, 0.8, 0.9, 0.95, 0.99)) +
+  stat_summary(aes(x=value, y=name, colour=" Median"), fun=median, geom="point", size=5, shape=15) +
+  theme_minimal() +
+  guides(colour = guide_legend(nrow = 1)) +
+  scale_color_brewer(name="Credible Interval", labels=c("Median", "50%", "80%", "90%", "95%", "99%"), direction=-1) +
+  theme(plot.title.position = "plot", axis.title.x=element_blank(), axis.title.y=element_blank(), legend.position="top") +
+  labs(title="Binary Population Level Coefficents")
+print(p2)
+
+p3 <- ggplot(samples_df_exp %>% filter(name == "Week of Admission")) +
+  geom_vline(aes(xintercept=1)) +
+  stat_interval(aes(x=value, y=name), .width=c(0.5, 0.8, 0.9, 0.95, 0.99)) +
+  stat_summary(aes(x=value, y=name, colour=" Median"), fun=median, geom="point", size=5, shape=15) +
+  theme_minimal() +
+  guides(colour = guide_legend(nrow = 1)) +
+  scale_color_brewer(name="Credible Interval", labels=c("Median", "50%", "80%", "90%", "95%", "99%"), direction=-1) +
+  theme(plot.title.position = "plot", axis.title.x=element_blank(), axis.title.y=element_blank(), legend.position="top") +
+  labs(title="Continuous Population Level Coefficents")
+print(p3)
+
+samples_df <- tibble(as.data.frame(fit_deltaocc_icu$fit)[c(
+  # "sd_ethnicity6__a_Intercept",
+  "r_obese__a[Obese,Intercept]",
+  "r_obese__a[Non-Obese,Intercept]",
+  "r_obese__a[Missing,Intercept]"
+)]) %>%
+  select(
+  # "Ethnicity Intercept SD" = "sd_ethnicity6__a_Intercept",
+  "Obese" = "r_obese__a[Obese,Intercept]",
+  "Non-Obese" = "r_obese__a[Non-Obese,Intercept]",
+  "Missing" = "r_obese__a[Missing,Intercept]"
+  )
+
+samples_df_exp <- samples_df %>% exp() %>% gather(name, value) %>% mutate(
+  name = factor(name, levels = rev(c(
+  "Obese",
+  "Non-Obese",
+  "Missing"
+  )))
+)
+
+p4 <- ggplot(samples_df_exp) +
+  geom_vline(aes(xintercept=1)) +
+  stat_interval(aes(x=value, y=name), .width=c(0.5, 0.8, 0.9, 0.95, 0.99)) +
+  stat_summary(aes(x=value, y=name, colour=" Median"), fun=median, geom="point", size=5, shape=15) +
+  theme_minimal() +
+  guides(colour = guide_legend(nrow = 1)) +
+  scale_color_brewer(name="Credible Interval", labels=c("Median", "50%", "80%", "90%", "95%", "99%"), direction=-1) +
+  theme(plot.title.position = "plot", axis.title.x=element_blank(), axis.title.y=element_blank(), legend.position="top") +
+  labs(title="Obesity Group Level Effect Intercepts")
+print(p4)
+
+samples_df <- tibble(as.data.frame(fit_deltaocc_icu$fit)[c(
+  "r_ethnicity6__a[White,Intercept]",
+  "r_ethnicity6__a[Asian.Subcontinent,Intercept]",
+  "r_ethnicity6__a[Asian.(Other),Intercept]",
+  "r_ethnicity6__a[Black,Intercept]",
+  "r_ethnicity6__a[Mixed,Intercept]",
+  "r_ethnicity6__a[Other,Intercept]",
+  "r_ethnicity6__a[Missing,Intercept]"
+)]) %>%
+  select(
+  "White" = "r_ethnicity6__a[White,Intercept]",
+  "Asian Subcontinent" = "r_ethnicity6__a[Asian.Subcontinent,Intercept]",
+  "Asian (Other)" = "r_ethnicity6__a[Asian.(Other),Intercept]",
+  "Black" = "r_ethnicity6__a[Black,Intercept]",
+  "Mixed" = "r_ethnicity6__a[Mixed,Intercept]",
+  "Other" = "r_ethnicity6__a[Other,Intercept]",
+  "Missing" = "r_ethnicity6__a[Missing,Intercept]"
+  )
+
+samples_df_exp <- samples_df %>% exp() %>% gather(name, value) %>% mutate(
+  name = factor(name, levels = rev(c(
+  "White",
+  "Asian Subcontinent",
+  "Asian (Other)",
+  "Black",
+  "Mixed",
+  "Other",
+  "Missing"
+  )))
+)
+
+p5 <- ggplot(samples_df_exp) +
+  geom_vline(aes(xintercept=1)) +
+  stat_interval(aes(x=value, y=name), .width=c(0.5, 0.8, 0.9, 0.95, 0.99)) +
+  stat_summary(aes(x=value, y=name, colour=" Median"), fun=median, geom="point", size=5, shape=15) +
+  theme_minimal() +
+  guides(colour = guide_legend(nrow = 1)) +
+  scale_color_brewer(name="Credible Interval", labels=c("Median", "50%", "80%", "90%", "95%", "99%"), direction=-1) +
+  theme(plot.title.position = "plot", axis.title.x=element_blank(), axis.title.y=element_blank(), legend.position="top") +
+  labs(title="Ethnicity Group Level Intercepts")
+print(p5)
+
+p <- ggpubr::ggarrange(p1, p2, p3, p4, p5, ncol=1, heights = c(1.25,7,1.25,2.7,5), common.legend=TRUE, align="v")
+
+ggsave("figures/forest_main_icu.png", p, height=14, width=10)
+ggsave("figures/forest_main_icu.pdf", p, height=14, width=10)
+
+
+samples_df <- tibble(as.data.frame(fit_deltaocc_icu$fit)) %>% select(contains("r_trustcode")) %>%
+  rename_all(
+      funs(
+        stringr::str_replace_all(., 'r_trustcode__a\\[', '') %>%
+        stringr::str_replace_all(., ',Intercept\\]', '')
+      )
+  )
+
+samples_df_exp <- samples_df %>%
+  exp() %>%
+  gather(trustcode, value) %>% inner_join(df_primary_icu_checkpoint %>% select(trustname, trustcode) %>% mutate(trustname = str_replace_all(str_to_title(trustname), "Nhs", "NHS")) %>% distinct())
+ordered_trusts <- samples_df_exp %>% group_by(trustname) %>% summarise(med = median(value)) %>% arrange(med) %>% pull(trustname)
+
+samples_df_exp <- samples_df_exp %>% mutate(
+  trustname = factor(trustname, levels=ordered_trusts)
+)
+
+p6 <- ggplot(samples_df_exp) +
+  geom_vline(aes(xintercept=1)) +
+  stat_interval(aes(x=value, y=trustname), .width=c(0.5, 0.8, 0.9, 0.95, 0.99)) +
+  stat_summary(aes(x=value, y=trustname, colour=" Median"), fun=median, geom="point", size=2.5, shape=15) +
+  theme_minimal() +
+  guides(colour = guide_legend(nrow = 1)) +
+  scale_color_brewer(name="Credible Interval", labels=c("Median", "50%", "80%", "90%", "95%", "99%"), direction=-1) +
+  theme(plot.title.position = "plot", axis.title.x=element_blank(), axis.title.y=element_blank(), legend.position="top") +
+  scale_x_log10()
+print(p6)
+
+ggsave("figures/forest_trust_icu.png", p6, height=14, width=10)
+ggsave("figures/forest_trust_icu.pdf", p6, height=14, width=10)
+
+```
+
+
+```{r}
+
+samples_df <- tibble(as.data.frame(fit_deltaocc_hdu$fit)[c(
+  "b_a_Intercept",
+  "b_a_CriticalCareDeltaOcc",
+  "b_a_sexMale",
+  "b_a_isdiabetes_cleanYes",
+  "b_a_respiratory_and_asthma_cleanYes",
+  "b_a_chronicheart_cleanYes",
+  "b_a_chronicrenal_cleanYes",
+  "b_a_chronicneurological_cleanYes",
+  "b_a_chronicliver_cleanYes",
+  "b_a_immunosuppressiondisease_cleanYes",
+  "b_a_hypertension_cleanYes",
+  "b_a_week_hosp"
+)]) %>%
+  select(
+    "Intercept" = `b_a_Intercept`,
+    "Delta Occupancy (HDU)" = `b_a_CriticalCareDeltaOcc`,
+    "Male" = `b_a_sexMale`,
+    "Diabetes" = `b_a_isdiabetes_cleanYes`,
+    "Chronic Respiratory Disease(s)" = `b_a_respiratory_and_asthma_cleanYes`,
+    "Chronic Heart Disease" = `b_a_chronicheart_cleanYes`,
+    "Chronic Renal Disease" = `b_a_chronicrenal_cleanYes`,
+    "Chronic Neurological Disease" = `b_a_chronicneurological_cleanYes`,
+    "Chronic Liver Disease" = `b_a_chronicliver_cleanYes`,
+    "Immunosuppressive Disease" = `b_a_immunosuppressiondisease_cleanYes`,
+    "Hypertension" = `b_a_hypertension_cleanYes`,
+    "Week of Admission" = `b_a_week_hosp`
+  )
+
+samples_df_exp <- samples_df %>% exp() %>% gather(name, value) %>% mutate(
+  name = factor(name, levels = rev(c(
+    "Intercept",
+    "Delta Occupancy (HDU)",
+    "Male",
+    "Diabetes",
+    "Chronic Respiratory Disease(s)",
+    "Chronic Heart Disease",
+    "Chronic Renal Disease",
+    "Chronic Neurological Disease",
+    "Chronic Liver Disease",
+    "Immunosuppressive Disease",
+    "Hypertension",
+    "Week of Admission"
+  )))
+)
+
+p1 <- ggplot(samples_df_exp %>% filter(name == "Intercept") %>% mutate(name = "")) +
+  geom_vline(aes(xintercept=1)) +
+  stat_interval(aes(x=value, y=name), .width=c(0.5, 0.8, 0.9, 0.95, 0.99)) +
+  stat_summary(aes(x=value, y=name, colour=" Median"), fun=median, geom="point", size=5, shape=15) +
+  theme_minimal() +
+  guides(colour = guide_legend(nrow = 1)) +
+  scale_color_brewer(name="Credible Interval", labels=c("Median", "50%", "80%", "90%", "95%", "99%"), direction=-1) +
+  theme(plot.title.position = "plot", axis.title.x=element_blank(), axis.title.y=element_blank(), legend.position="top") +
+  labs(title="Intercept")
+print(p1)
+
+p2 <- ggplot(samples_df_exp %>% filter(!name %in% c("Intercept", "Week of Admission"))) +
+  geom_vline(aes(xintercept=1)) +
+  stat_interval(aes(x=value, y=name), .width=c(0.5, 0.8, 0.9, 0.95, 0.99)) +
+  stat_summary(aes(x=value, y=name, colour=" Median"), fun=median, geom="point", size=5, shape=15) +
+  theme_minimal() +
+  guides(colour = guide_legend(nrow = 1)) +
+  scale_color_brewer(name="Credible Interval", labels=c("Median", "50%", "80%", "90%", "95%", "99%"), direction=-1) +
+  theme(plot.title.position = "plot", axis.title.x=element_blank(), axis.title.y=element_blank(), legend.position="top") +
+  labs(title="Binary Population Level Coefficents")
+print(p2)
+
+p3 <- ggplot(samples_df_exp %>% filter(name == "Week of Admission")) +
+  geom_vline(aes(xintercept=1)) +
+  stat_interval(aes(x=value, y=name), .width=c(0.5, 0.8, 0.9, 0.95, 0.99)) +
+  stat_summary(aes(x=value, y=name, colour=" Median"), fun=median, geom="point", size=5, shape=15) +
+  theme_minimal() +
+  guides(colour = guide_legend(nrow = 1)) +
+  scale_color_brewer(name="Credible Interval", labels=c("Median", "50%", "80%", "90%", "95%", "99%"), direction=-1) +
+  theme(plot.title.position = "plot", axis.title.x=element_blank(), axis.title.y=element_blank(), legend.position="top") +
+  labs(title="Continuous Population Level Coefficents")
+print(p3)
+
+samples_df <- tibble(as.data.frame(fit_deltaocc_hdu$fit)[c(
+  # "sd_ethnicity6__a_Intercept",
+  "r_obese__a[Obese,Intercept]",
+  "r_obese__a[Non-Obese,Intercept]",
+  "r_obese__a[Missing,Intercept]"
+)]) %>%
+  select(
+  # "Ethnicity Intercept SD" = "sd_ethnicity6__a_Intercept",
+  "Obese" = "r_obese__a[Obese,Intercept]",
+  "Non-Obese" = "r_obese__a[Non-Obese,Intercept]",
+  "Missing" = "r_obese__a[Missing,Intercept]"
+  )
+
+samples_df_exp <- samples_df %>% exp() %>% gather(name, value) %>% mutate(
+  name = factor(name, levels = rev(c(
+  "Obese",
+  "Non-Obese",
+  "Missing"
+  )))
+)
+
+p4 <- ggplot(samples_df_exp) +
+  geom_vline(aes(xintercept=1)) +
+  stat_interval(aes(x=value, y=name), .width=c(0.5, 0.8, 0.9, 0.95, 0.99)) +
+  stat_summary(aes(x=value, y=name, colour=" Median"), fun=median, geom="point", size=5, shape=15) +
+  theme_minimal() +
+  guides(colour = guide_legend(nrow = 1)) +
+  scale_color_brewer(name="Credible Interval", labels=c("Median", "50%", "80%", "90%", "95%", "99%"), direction=-1) +
+  theme(plot.title.position = "plot", axis.title.x=element_blank(), axis.title.y=element_blank(), legend.position="top") +
+  labs(title="Obesity Group Level Effect Intercepts")
+print(p4)
+
+samples_df <- tibble(as.data.frame(fit_deltaocc_hdu$fit)[c(
+  "r_ethnicity6__a[White,Intercept]",
+  "r_ethnicity6__a[Asian.Subcontinent,Intercept]",
+  "r_ethnicity6__a[Asian.(Other),Intercept]",
+  "r_ethnicity6__a[Black,Intercept]",
+  "r_ethnicity6__a[Mixed,Intercept]",
+  "r_ethnicity6__a[Other,Intercept]",
+  "r_ethnicity6__a[Missing,Intercept]"
+)]) %>%
+  select(
+  "White" = "r_ethnicity6__a[White,Intercept]",
+  "Asian Subcontinent" = "r_ethnicity6__a[Asian.Subcontinent,Intercept]",
+  "Asian (Other)" = "r_ethnicity6__a[Asian.(Other),Intercept]",
+  "Black" = "r_ethnicity6__a[Black,Intercept]",
+  "Mixed" = "r_ethnicity6__a[Mixed,Intercept]",
+  "Other" = "r_ethnicity6__a[Other,Intercept]",
+  "Missing" = "r_ethnicity6__a[Missing,Intercept]"
+  )
+
+samples_df_exp <- samples_df %>% exp() %>% gather(name, value) %>% mutate(
+  name = factor(name, levels = rev(c(
+  "White",
+  "Asian Subcontinent",
+  "Asian (Other)",
+  "Black",
+  "Mixed",
+  "Other",
+  "Missing"
+  )))
+)
+
+p5 <- ggplot(samples_df_exp) +
+  geom_vline(aes(xintercept=1)) +
+  stat_interval(aes(x=value, y=name), .width=c(0.5, 0.8, 0.9, 0.95, 0.99)) +
+  stat_summary(aes(x=value, y=name, colour=" Median"), fun=median, geom="point", size=5, shape=15) +
+  theme_minimal() +
+  guides(colour = guide_legend(nrow = 1)) +
+  scale_color_brewer(name="Credible Interval", labels=c("Median", "50%", "80%", "90%", "95%", "99%"), direction=-1) +
+  theme(plot.title.position = "plot", axis.title.x=element_blank(), axis.title.y=element_blank(), legend.position="top") +
+  labs(title="Ethnicity Group Level Intercepts")
+print(p5)
+
+p <- ggpubr::ggarrange(p1, p2, p3, p4, p5, ncol=1, heights = c(1.25,7,1.25,2.7,5), common.legend=TRUE, align="v")
+
+ggsave("figures/forest_main_hdu.png", p, height=14, width=10)
+ggsave("figures/forest_main_hdu.pdf", p, height=14, width=10)
+
+
+samples_df <- tibble(as.data.frame(fit_deltaocc_hdu$fit)) %>% select(contains("r_trustcode")) %>%
+  rename_all(
+      funs(
+        stringr::str_replace_all(., 'r_trustcode__a\\[', '') %>%
+        stringr::str_replace_all(., ',Intercept\\]', '')
+      )
+  )
+
+samples_df_exp <- samples_df %>%
+  exp() %>%
+  gather(trustcode, value) %>% inner_join(df_primary_hdu_checkpoint %>% select(trustname, trustcode) %>% mutate(trustname = str_replace_all(str_to_title(trustname), "Nhs", "NHS")) %>% distinct())
+ordered_trusts <- samples_df_exp %>% group_by(trustname) %>% summarise(med = median(value)) %>% arrange(med) %>% pull(trustname)
+
+samples_df_exp <- samples_df_exp %>% mutate(
+  trustname = factor(trustname, levels=ordered_trusts)
+)
+
+p6 <- ggplot(samples_df_exp) +
+  geom_vline(aes(xintercept=1)) +
+  stat_interval(aes(x=value, y=trustname), .width=c(0.5, 0.8, 0.9, 0.95, 0.99)) +
+  stat_summary(aes(x=value, y=trustname, colour=" Median"), fun=median, geom="point", size=2.5, shape=15) +
+  theme_minimal() +
+  guides(colour = guide_legend(nrow = 1)) +
+  scale_color_brewer(name="Credible Interval", labels=c("Median", "50%", "80%", "90%", "95%", "99%"), direction=-1) +
+  theme(plot.title.position = "plot", axis.title.x=element_blank(), axis.title.y=element_blank(), legend.position="top") +
+  scale_x_log10()
+print(p6)
+
+ggsave("figures/forest_trust_hdu.png", p6, height=14, width=10)
+ggsave("figures/forest_trust_hdu.pdf", p6, height=14, width=10)
+
+```
+
+```{r forestpriors}
+load("fits/deltaocc_hdu_priors.RData")
+
+samples_df <- tibble(as.data.frame(fit_p1$fit)[c(
+  "b_a_Intercept",
+  "b_a_CriticalCareDeltaOcc",
+  "b_a_sexMale",
+  "b_a_isdiabetes_cleanYes",
+  "b_a_respiratory_and_asthma_cleanYes",
+  "b_a_chronicheart_cleanYes",
+  "b_a_chronicrenal_cleanYes",
+  "b_a_chronicneurological_cleanYes",
+  "b_a_immunosuppressiondisease_cleanYes",
+  "b_a_hypertension_cleanYes",
+  "b_a_chronicliver_cleanYes",
+  "b_a_week_hosp",
+)]) %>%
+  select(
+    "Intercept" = `b_a_Intercept`,
+    "Delta Occupancy (HDU)" = `b_a_CriticalCareDeltaOcc`,
+    "Male" = `b_a_sexMale`,
+    "Diabetes" = `b_a_isdiabetes_cleanYes`,
+    "Chronic Respiratory Disease(s)" = `b_a_respiratory_and_asthma_cleanYes`,
+    "Chronic Heart Disease" = `b_a_chronicheart_cleanYes`,
+    "Chronic Renal Disease" = `b_a_chronicrenal_cleanYes`,
+    "Chronic Neurolgical Disease" = `b_a_chronicneurological_cleanYes`,
+    "Immunosuppressive Disease" = `b_a_immunosuppressiondisease_cleanYes`,
+    "Hypertension" = `b_a_hypertension_cleanYes`,
+    "Chronic Liver Disease" = `b_a_chronicliver_cleanYes`,
+    "Week of Admission" = `b_a_week_hosp`,
+  )
+calc_intervals(fit_p1, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c(
+  "Intercept",
+  "Delta Occupancy (HDU)",
+  "Male",
+  "Diabetes",
+  "Chronic Respiratory Disease(s)",
+  "Chronic Heart Disease",
+  "Chronic Renal Disease",
+  "Chronic Neurolgical Disease",
+  "Immunosuppressive Disease",
+  "Hypertension",
+  "Chronic Liver Disease",
+  "Week of Admission",
+))
+
+
+samples_df <- tibble(as.data.frame(fit_p2$fit)[c(
+  "b_a_Intercept",
+  "b_a_CriticalCareDeltaOcc",
+  "b_a_sexMale",
+  "b_a_isdiabetes_cleanYes",
+  "b_a_respiratory_and_asthma_cleanYes",
+  "b_a_chronicheart_cleanYes",
+  "b_a_chronicrenal_cleanYes",
+  "b_a_chronicneurological_cleanYes",
+  "b_a_immunosuppressiondisease_cleanYes",
+  "b_a_hypertension_cleanYes",
+  "b_a_chronicliver_cleanYes",
+  "b_a_week_hosp",
+)]) %>%
+  select(
+    "Intercept" = `b_a_Intercept`,
+    "Delta Occupancy (HDU)" = `b_a_CriticalCareDeltaOcc`,
+    "Male" = `b_a_sexMale`,
+    "Diabetes" = `b_a_isdiabetes_cleanYes`,
+    "Chronic Respiratory Disease(s)" = `b_a_respiratory_and_asthma_cleanYes`,
+    "Chronic Heart Disease" = `b_a_chronicheart_cleanYes`,
+    "Chronic Renal Disease" = `b_a_chronicrenal_cleanYes`,
+    "Chronic Neurolgical Disease" = `b_a_chronicneurological_cleanYes`,
+    "Immunosuppressive Disease" = `b_a_immunosuppressiondisease_cleanYes`,
+    "Hypertension" = `b_a_hypertension_cleanYes`,
+    "Chronic Liver Disease" = `b_a_chronicliver_cleanYes`,
+    "Week of Admission" = `b_a_week_hosp`,
+  )
+calc_intervals(fit_p2, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c(
+  "Intercept",
+  "Delta Occupancy (HDU)",
+  "Male",
+  "Diabetes",
+  "Chronic Respiratory Disease(s)",
+  "Chronic Heart Disease",
+  "Chronic Renal Disease",
+  "Chronic Neurolgical Disease",
+  "Immunosuppressive Disease",
+  "Hypertension",
+  "Chronic Liver Disease",
+  "Week of Admission",
+))
+
+
+samples_df <- tibble(as.data.frame(fit_p3$fit)[c(
+  "b_a_Intercept",
+  "b_a_CriticalCareDeltaOcc",
+  "b_a_sexMale",
+  "b_a_isdiabetes_cleanYes",
+  "b_a_respiratory_and_asthma_cleanYes",
+  "b_a_chronicheart_cleanYes",
+  "b_a_chronicrenal_cleanYes",
+  "b_a_chronicneurological_cleanYes",
+  "b_a_immunosuppressiondisease_cleanYes",
+  "b_a_hypertension_cleanYes",
+  "b_a_chronicliver_cleanYes",
+  "b_a_week_hosp",
+)]) %>%
+  select(
+    "Intercept" = `b_a_Intercept`,
+    "Delta Occupancy (HDU)" = `b_a_CriticalCareDeltaOcc`,
+    "Male" = `b_a_sexMale`,
+    "Diabetes" = `b_a_isdiabetes_cleanYes`,
+    "Chronic Respiratory Disease(s)" = `b_a_respiratory_and_asthma_cleanYes`,
+    "Chronic Heart Disease" = `b_a_chronicheart_cleanYes`,
+    "Chronic Renal Disease" = `b_a_chronicrenal_cleanYes`,
+    "Chronic Neurolgical Disease" = `b_a_chronicneurological_cleanYes`,
+    "Immunosuppressive Disease" = `b_a_immunosuppressiondisease_cleanYes`,
+    "Hypertension" = `b_a_hypertension_cleanYes`,
+    "Chronic Liver Disease" = `b_a_chronicliver_cleanYes`,
+    "Week of Admission" = `b_a_week_hosp`,
+  )
+calc_intervals(fit_p3, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c(
+  "Intercept",
+  "Delta Occupancy (HDU)",
+  "Male",
+  "Diabetes",
+  "Chronic Respiratory Disease(s)",
+  "Chronic Heart Disease",
+  "Chronic Renal Disease",
+  "Chronic Neurolgical Disease",
+  "Immunosuppressive Disease",
+  "Hypertension",
+  "Chronic Liver Disease",
+  "Week of Admission",
+))
+
+
+samples_df <- tibble(as.data.frame(fit_p4$fit)[c(
+  "b_a_Intercept",
+  "b_a_CriticalCareDeltaOcc",
+  "b_a_sexMale",
+  "b_a_isdiabetes_cleanYes",
+  "b_a_respiratory_and_asthma_cleanYes",
+  "b_a_chronicheart_cleanYes",
+  "b_a_chronicrenal_cleanYes",
+  "b_a_chronicneurological_cleanYes",
+  "b_a_immunosuppressiondisease_cleanYes",
+  "b_a_hypertension_cleanYes",
+  "b_a_chronicliver_cleanYes",
+  "b_a_week_hosp",
+)]) %>%
+  select(
+    "Intercept" = `b_a_Intercept`,
+    "Delta Occupancy (HDU)" = `b_a_CriticalCareDeltaOcc`,
+    "Male" = `b_a_sexMale`,
+    "Diabetes" = `b_a_isdiabetes_cleanYes`,
+    "Chronic Respiratory Disease(s)" = `b_a_respiratory_and_asthma_cleanYes`,
+    "Chronic Heart Disease" = `b_a_chronicheart_cleanYes`,
+    "Chronic Renal Disease" = `b_a_chronicrenal_cleanYes`,
+    "Chronic Neurolgical Disease" = `b_a_chronicneurological_cleanYes`,
+    "Immunosuppressive Disease" = `b_a_immunosuppressiondisease_cleanYes`,
+    "Hypertension" = `b_a_hypertension_cleanYes`,
+    "Chronic Liver Disease" = `b_a_chronicliver_cleanYes`,
+    "Week of Admission" = `b_a_week_hosp`,
+  )
+calc_intervals(fit_p4, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c(
+  "Intercept",
+  "Delta Occupancy (HDU)",
+  "Male",
+  "Diabetes",
+  "Chronic Respiratory Disease(s)",
+  "Chronic Heart Disease",
+  "Chronic Renal Disease",
+  "Chronic Neurolgical Disease",
+  "Immunosuppressive Disease",
+  "Hypertension",
+  "Chronic Liver Disease",
+  "Week of Admission",
+))
+
+
+samples_df <- tibble(as.data.frame(fit_p5$fit)[c(
+  "b_a_Intercept",
+  "b_a_CriticalCareDeltaOcc",
+  "b_a_sexMale",
+  "b_a_isdiabetes_cleanYes",
+  "b_a_respiratory_and_asthma_cleanYes",
+  "b_a_chronicheart_cleanYes",
+  "b_a_chronicrenal_cleanYes",
+  "b_a_chronicneurological_cleanYes",
+  "b_a_immunosuppressiondisease_cleanYes",
+  "b_a_hypertension_cleanYes",
+  "b_a_chronicliver_cleanYes",
+  "b_a_week_hosp",
+)]) %>%
+  select(
+    "Intercept" = `b_a_Intercept`,
+    "Delta Occupancy (HDU)" = `b_a_CriticalCareDeltaOcc`,
+    "Male" = `b_a_sexMale`,
+    "Diabetes" = `b_a_isdiabetes_cleanYes`,
+    "Chronic Respiratory Disease(s)" = `b_a_respiratory_and_asthma_cleanYes`,
+    "Chronic Heart Disease" = `b_a_chronicheart_cleanYes`,
+    "Chronic Renal Disease" = `b_a_chronicrenal_cleanYes`,
+    "Chronic Neurolgical Disease" = `b_a_chronicneurological_cleanYes`,
+    "Immunosuppressive Disease" = `b_a_immunosuppressiondisease_cleanYes`,
+    "Hypertension" = `b_a_hypertension_cleanYes`,
+    "Chronic Liver Disease" = `b_a_chronicliver_cleanYes`,
+    "Week of Admission" = `b_a_week_hosp`,
+  )
+calc_intervals(fit_p5, ci1_fun="eti", ci2_fun="eti", ci1=0.9, ci2=0.95, two_cis=T, save_cis=T, cols=c(
+  "Intercept",
+  "Delta Occupancy (HDU)",
+  "Male",
+  "Diabetes",
+  "Chronic Respiratory Disease(s)",
+  "Chronic Heart Disease",
+  "Chronic Renal Disease",
+  "Chronic Neurolgical Disease",
+  "Immunosuppressive Disease",
+  "Hypertension",
+  "Chronic Liver Disease",
+  "Week of Admission",
+))
+
+```
+
+```{r done}
+print("done")
+```
+
